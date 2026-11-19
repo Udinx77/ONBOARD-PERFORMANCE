@@ -1,0 +1,174 @@
+@page "/report/sqlite"
+@using System.Globalization
+@using FmsOnboard.Core
+@inject AppConfig Cfg
+@{
+    var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Cfg.Timezone));
+    var dateParam = Request.Query["date"].ToString().Trim();
+    var selectedDate = DateOnly.TryParseExact(dateParam, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : today;
+    var selectedDateStr = selectedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    Dictionary<string, object?>? report = null;
+    Dictionary<string, object?>? monthly = null;
+    string? error = null;
+
+    try
+    {
+        report = AvailabilityReportService.BuildReport(Cfg, selectedDate);
+        monthly = MonthlyReportService.BuildMonthlyContext(Cfg);
+    }
+    catch (Exception ex)
+    {
+        error = ex.Message;
+        try { monthly = MonthlyReportService.BuildMonthlyContext(Cfg); } catch { }
+    }
+}
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Laporan Availability SQLite — FMS Onboard</title>
+  <style>
+    :root {
+      --bg: #0b101b; --surface: #121a2b; --elevated: #182236; --border: #24324d;
+      --text: #f1f5f9; --muted: #94a3b8;
+      --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: var(--font-sans); padding: 20px; }
+    .wrap { max-width: 1560px; margin: 0 auto; }
+    .head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    input, select, .btn { background: var(--elevated); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13px; text-decoration: none; cursor: pointer; }
+    .btn:hover { border-color: #38bdf8; }
+    .err { background: rgba(239,68,68,0.16); border: 1px solid #ef4444; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    .card h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; }
+    .card .val { font-size: 24px; font-weight: 700; font-family: var(--font-mono); margin: 6px 0; }
+    .card .sub { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+    .table-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: auto; max-height: 70vh; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { position: sticky; top: 0; background: #162033; text-align: left; font-size: 11px; text-transform: uppercase; color: var(--muted); z-index: 2; }
+    th.num, td.num { text-align: right; font-family: var(--font-mono); }
+    .badge { padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+    .Green { background: rgba(16,185,129,0.18); color: #6ee7b7; }
+    .Yellow { background: rgba(245,158,11,0.2); color: #fcd34d; }
+    .Orange { background: rgba(251,146,60,0.2); color: #fdba74; }
+    .Red { background: rgba(239,68,68,0.2); color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <h1 style="font-size:18px;">LAPORAN AVAILABILITY & STATUS SQLITE</h1>
+        <small style="color:var(--muted);">Overall hanya menghitung Radio (R) + Display (D) + PLE (P); GPS (G) tampil terpisah.</small>
+      </div>
+      <div class="controls">
+        <a class="btn" href="/">Dashboard</a>
+        <form method="get" action="/report/sqlite" style="display:inline-flex;gap:6px;">
+          <input type="date" name="date" value="@selectedDateStr" />
+          <button class="btn" type="submit">Tampilkan</button>
+        </form>
+        @if (report is not null)
+        {
+          <a class="btn" href="/export/availability.xlsx?date=@report["date"]">Export Harian XLSX</a>
+          <a class="btn" href="/export/availability.pdf?date=@report["date"]">Export PDF</a>
+        }
+        @if (monthly is not null && monthly["months"] is List<Dictionary<string, object?>> mList && mList.Count > 0)
+        {
+          <form method="get" action="/export/availability_monthly.xlsx" style="display:inline-flex;gap:6px;">
+            <select name="month">
+              @foreach (var m in mList)
+              {
+                <option value="@m["month"]">@m["month"] (@m["days"] hari)</option>
+              }
+            </select>
+            <button class="btn" type="submit">Export Bulanan XLSX</button>
+          </form>
+        }
+      </div>
+    </div>
+
+    @if (!string.IsNullOrEmpty(error))
+    {
+      <div class="err">@error</div>
+    }
+
+    @if (report is not null)
+    {
+      var overallTypes = (List<string>)report["overall_device_types"]!;
+      var deviceTypes = (List<string>)report["device_types"]!;
+      var overall = (Dictionary<string, Dictionary<string, object?>>)report["overall"]!;
+      var gpsOverall = report["gps_overall"] as Dictionary<string, object?>;
+      var units = (List<Dictionary<string, object?>>)report["units"]!;
+
+      <div class="summary-grid">
+        @foreach (var k in overallTypes)
+        {
+          var item = overall[k];
+          <div class="card">
+            <h3>Perangkat @k</h3>
+            <div class="val">@(item["availability_pct"] is double av ? $"{av:F2}%" : "N/A")</div>
+            <div class="sub">Coverage: @($"{Convert.ToDouble(item["coverage_pct"]):F2}%") | Target: @item["target_count"]</div>
+          </div>
+        }
+        @{ var comb = overall["combined"]; }
+        <div class="card">
+          <h3>Gabungan (R + D + P)</h3>
+          <div class="val">@(comb["availability_pct"] is double cav ? $"{cav:F2}%" : "N/A")</div>
+          <div class="sub">Coverage: @($"{Convert.ToDouble(comb["coverage_pct"]):F2}%") | Excluded BD: @report["excluded_count"]</div>
+        </div>
+        @if (gpsOverall is not null)
+        {
+          <div class="card">
+            <h3>GPS Satelit (G)</h3>
+            <div class="val">@(gpsOverall["availability_pct"] is double gav ? $"{gav:F2}%" : "N/A")</div>
+            <div class="sub">Coverage: @($"{Convert.ToDouble(gpsOverall["coverage_pct"]):F2}%")</div>
+          </div>
+        }
+      </div>
+
+      <div class="table-box">
+        <table>
+          <thead>
+            <tr>
+              <th class="num">No</th><th class="num">OID</th><th>Unit</th><th>Tipe</th><th>IP / Sumber</th>
+              <th>Status</th><th class="num">Loss</th><th class="num">Uptime (j)</th><th class="num">Downtime (j)</th>
+              <th class="num">Coverage</th><th class="num">Availability</th>
+            </tr>
+          </thead>
+          <tbody>
+            @foreach (var u in units)
+            {
+              var devs = (Dictionary<string, Dictionary<string, object?>>)u["devices"]!;
+              bool excl = u["excluded"] is true;
+              foreach (var t in deviceTypes)
+              {
+                var d = devs[t];
+                <tr>
+                  <td class="num">@u["rank"]</td>
+                  <td class="num">@u["machine_oid"]</td>
+                  <td>@u["machine_name"]@(excl ? " (BD)" : "")</td>
+                  <td>@t</td>
+                  <td style="font-family:var(--font-mono);">@(d["ip_address"] ?? "-")</td>
+                  <td><span class="badge @d["status"]">@d["status"]</span></td>
+                  <td class="num">@(d["packet_loss_pct"] is double l ? $"{l:F1}%" : "N/A")</td>
+                  <td class="num">@($"{Convert.ToDouble(d["uptime_seconds"]) / 3600.0:F2}")</td>
+                  <td class="num">@($"{Convert.ToDouble(d["downtime_seconds"]) / 3600.0:F2}")</td>
+                  <td class="num">@($"{Convert.ToDouble(d["coverage_pct"]):F2}%")</td>
+                  <td class="num"><strong>@(d["availability_pct"] is double a ? $"{a:F2}%" : "N/A")</strong></td>
+                </tr>
+              }
+            }
+          </tbody>
+        </table>
+      </div>
+    }
+  </div>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# Build & Runtime (.NET 8)
+bin/
+obj/
+out/
+publish/
+*.dll
+*.exe
+*.pdb
+
+# IDE & OS
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Konfigurasi & Kredensial (IP, Connection String, Secret)
+appsettings.json
+appsettings.*.json
+!appsettings.example.json
+.env
+.env.*
+secrets.json
+
+# Database SQLite & Data Telemetry Lokal
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.monitoring.db
+*query_machine.sql
+*query_gps.sql
+data/
+
+# Hasil Export & Log
+*.xlsx
+*.xls
+*.csv
+*.log
+logs/
