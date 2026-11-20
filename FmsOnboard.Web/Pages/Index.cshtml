@@ -23,7 +23,7 @@
       --text-secondary: #ffffff;
       --text-muted: #ffffff;
 
-      --accent: #3b3b3b;
+      --accent: #6d6d6d;
       --accent-ink: #ffffff;
 
       --ok: #2dff37;
@@ -71,6 +71,126 @@
       font-size: 13px;
       line-height: 1.4;
       -webkit-font-smoothing: antialiased;
+    }
+
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 54px;
+      z-index: 45;
+      background: var(--bg-topbar);
+      border-right: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      transition: width 0.18s ease;
+      overflow: hidden;
+    }
+    .sidebar.expanded {
+      width: 224px;
+    }
+    .sidebar-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px;
+      min-height: 55px;
+      border-bottom: 1px solid var(--border-subtle);
+      flex-shrink: 0;
+    }
+    .sidebar-toggle {
+      width: 44px;
+      height: 44px;
+      flex-shrink: 0;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+    .sidebar-toggle:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+    }
+    .sidebar-brand {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 0.14s ease;
+    }
+    .sidebar.expanded .sidebar-brand {
+      opacity: 1;
+    }
+    .sidebar-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 5px;
+    }
+    .sidebar-link {
+      min-height: 44px;
+      padding: 0 12px;
+      border-radius: 7px;
+      border: 1px solid transparent;
+      color: var(--text-secondary);
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .sidebar-link:hover {
+      background: var(--bg-card);
+      border-color: var(--border-subtle);
+      color: var(--text-primary);
+    }
+    .sidebar-link.active {
+      background: var(--bg-card);
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+      font-weight: 700;
+    }
+    .sidebar-ico {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+    .sidebar-lbl {
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0;
+      transition: opacity 0.14s ease;
+    }
+    .sidebar.expanded .sidebar-lbl {
+      opacity: 1;
+    }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 40;
+    }
+    .app-main {
+      margin-left: 54px;
+      width: calc(100% - 54px);
+      min-height: 100vh;
+      transition: margin-left 0.18s ease, width 0.18s ease;
+    }
+    body.sidebar-open .app-main {
+      margin-left: 224px;
+      width: calc(100% - 224px);
     }
 
     .topbar {
@@ -506,6 +626,12 @@
       .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
+    @@media (max-width: 768px) {
+      .sidebar.expanded { box-shadow: 6px 0 24px rgba(0, 0, 0, 0.75); }
+      body.sidebar-open .app-main { margin-left: 54px; width: calc(100% - 54px); }
+      body.sidebar-open .sidebar-backdrop { display: block; }
+    }
+
     @@media (max-width: 640px) {
       .topbar { padding: 10px 12px; }
       .container { padding: 10px 12px 24px; }
@@ -516,6 +642,38 @@
   </style>
 </head>
 <body>
+  <aside id="appSidebar" class="sidebar" aria-label="Menu Navigasi Utama">
+    <div class="sidebar-top">
+      <button type="button" id="sidebarToggle" class="sidebar-toggle" aria-expanded="false" aria-controls="sidebarNav" aria-label="Buka atau tutup sidebar" title="Menu">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="6" x2="21" y2="6"></line>
+          <line x1="3" y1="12" x2="21" y2="12"></line>
+          <line x1="3" y1="18" x2="21" y2="18"></line>
+        </svg>
+      </button>
+      <span class="sidebar-brand">NAVIGASI</span>
+    </div>
+    <nav id="sidebarNav" class="sidebar-nav">
+      <a class="sidebar-link active" href="/" aria-current="page" title="Live Telemetry">
+        <svg class="sidebar-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+        <span class="sidebar-lbl">Live Telemetry</span>
+      </a>
+      <a class="sidebar-link" href="/report/sqlite" title="Availability Dashboard">
+        <svg class="sidebar-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="7" height="9" rx="1"></rect>
+          <rect x="14" y="3" width="7" height="5" rx="1"></rect>
+          <rect x="14" y="12" width="7" height="9" rx="1"></rect>
+          <rect x="3" y="16" width="7" height="5" rx="1"></rect>
+        </svg>
+        <span class="sidebar-lbl">Availability Dashboard</span>
+      </a>
+    </nav>
+  </aside>
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+
+  <div class="app-main">
   <header class="topbar">
     <div class="brand-block">
       <div class="brand-title-row">
@@ -530,10 +688,6 @@
     </div>
 
     <div class="header-right">
-      <div class="nav-links">
-        <a class="btn" href="/report/sqlite">Availability Dashboard</a>
-        <a class="btn" href="/export/availability.xlsx">Export XLSX</a>
-      </div>
       <div class="kpi-box" aria-label="Ringkasan Availability">
         <div class="kpi-main">
           <span class="kpi-main-lbl">Overall</span>
@@ -655,6 +809,8 @@
       <div>OP: Operasional, HS: Health/Delay, R: Radio, D: Display, P: PLE, G: GPS Satelit (merah &le; @Cfg.GpsRedBelow, kuning &le; @Cfg.GpsYellowMax). Klik card unit untuk melihat detail availability perangkat onboard.</div>
     </footer>
   </main>
+
+  </div>
 
   <div id="drawerBackdrop" class="drawer-backdrop" role="dialog" aria-modal="true">
     <div class="drawer">
@@ -868,7 +1024,27 @@
     function openDrawer(oid) { selectedOid = oid; renderDrawerContent(oid); document.getElementById("drawerBackdrop").classList.add("open"); }
     document.getElementById("drawerClose").addEventListener("click", () => { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); });
     document.getElementById("drawerBackdrop").addEventListener("click", e => { if (e.target.id === "drawerBackdrop") { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); } });
-    document.addEventListener("keydown", e => { if (e.key === "Escape" && selectedOid !== null) { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); } });
+    const appSidebar = document.getElementById("appSidebar");
+    const sidebarToggle = document.getElementById("sidebarToggle");
+    const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+    function setSidebarExpanded(open) {
+      appSidebar.classList.toggle("expanded", open);
+      document.body.classList.toggle("sidebar-open", open);
+      sidebarToggle.setAttribute("aria-expanded", String(open));
+    }
+    sidebarToggle.addEventListener("click", () => setSidebarExpanded(!appSidebar.classList.contains("expanded")));
+    sidebarBackdrop.addEventListener("click", () => setSidebarExpanded(false));
+
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape") {
+        if (selectedOid !== null) {
+          selectedOid = null;
+          document.getElementById("drawerBackdrop").classList.remove("open");
+        } else if (appSidebar.classList.contains("expanded")) {
+          setSidebarExpanded(false);
+        }
+      }
+    });
 
     document.querySelectorAll(".sum-card").forEach(btn => {
       btn.addEventListener("click", () => {

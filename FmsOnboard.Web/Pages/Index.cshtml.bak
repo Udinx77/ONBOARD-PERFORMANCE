@@ -721,15 +721,15 @@
       const cat = classifyUnit(u), p = u.ping || {};
       const prefix = getUnitPrefix(u.Name);
       const role = getUnitRole(u.Name);
-      const hasDelay = Boolean(u.DelayClassName || u.DelayCategory || u.DelayClassOid);
-      const isEngineOn = !u.is_bd && (hasDelay || u.MachineStatus === 2 || u.MachineStatus === 0);
+      const hasDelay = Boolean(u.DelayClassName);
+      const isEngineOn = u.MachineStatus === 1;
       const opTone = u.is_bd ? "crit" : (isEngineOn ? "ok" : "crit");
       const opText = u.is_bd ? "BD" : (hasDelay ? "DLY (Mesin Nyala)" : (isEngineOn ? "RUN" : "OFF"));
       const hsTone = u.is_bd ? "neutral" : (hasDelay ? "warn" : "ok");
       const gTone = satTone(u.GPS_SATELLITES, u.GPS_STATE);
       const lamps = [
-        { k: "OP", tone: opTone, tip: `OP: ${opText} (MachineStatus: ${u.MachineStatus})` },
-        { k: "HS", tone: hsTone, tip: `HS: ${u.DelayClassName || "Normal"}` },
+        { k: "OP", tone: opTone, tip: `OP: ${opText} | Kondisi: ${u.DelayClassName || (isEngineOn ? "Normal" : "Engine Off")} (IS_ACTIVE: ${u.MachineStatus})` },
+        { k: "HS", tone: hsTone, tip: `Kondisi: ${u.DelayClassName || "Normal"}` },
         { k: "R", tone: pingTone(p.R), tip: p.R ? `Radio (${p.R.ip}) - klik card untuk detail availability` : "Radio: No IP" },
         { k: "D", tone: pingTone(p.D), tip: p.D ? `Display (${p.D.ip}) - klik card untuk detail availability` : "Display: No IP" },
         { k: "P", tone: pingTone(p.P), tip: p.P ? `PLE (${p.P.ip}) - klik card untuk detail availability` : "PLE: No IP" },
@@ -857,7 +857,7 @@
       const u = allUnits.find(x => x.OID === oid); if (!u) return;
       const role = getUnitRole(u.Name);
       document.getElementById("drawerTitle").textContent = `${u.Name} (OID ${u.OID})`;
-      document.getElementById("drawerSub").textContent = `${role ? role + " | " : ""}${u.is_bd ? "Status: BREAKDOWN" : (u.DelayClassName || "Status: Normal")}`;
+      document.getElementById("drawerSub").textContent = `${role ? role + " | " : ""}${u.is_bd ? "Status: BREAKDOWN" : (u.DelayClassName || (u.MachineStatus === 1 ? "Status: Normal" : "Status: Engine OFF"))}`;
       const p = u.ping || {};
       const rows = ["R", "D", "P"].map(k => {
         const d = p[k];
