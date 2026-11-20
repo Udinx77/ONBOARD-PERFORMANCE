@@ -19,22 +19,26 @@ public static class DatabaseService
         try
         {
             const string sql = """
+                SET NOCOUNT ON;
+                SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
                 SELECT
                     m.MACHINE_OID,
                     CAST(m.IS_ACTIVE AS INT) AS IsActive,
                     J1.NAME AS DelayName,
                     J1.DELAYCATEGORY,
                     J1.DELAYCLASS_OID
-                FROM [msmodel_rep].[dbo].[MACHINE] m
-                LEFT JOIN [mshist_rep].[dbo].[DELAY] P
+                FROM [msmodel_rep].[dbo].[MACHINE] m WITH (NOLOCK)
+                LEFT JOIN [mshist_rep].[dbo].[DELAY] P WITH (NOLOCK)
                     ON P.TARGET_MACHINE = m.MACHINE_OID AND P.STATUS = 3
-                LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] J1
+                LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] J1 WITH (NOLOCK)
                     ON P.DELAYCLASS = J1.DELAYCLASS_OID
                 WHERE LEFT(UPPER(LTRIM(RTRIM(m.NAME))), 2) IN ('CB', 'HB', 'KB', 'CT', 'KT')
+                OPTION (RECOMPILE);
                 """;
             using var odbcConn = new OdbcConnection(cfg.SqlConnectionString);
             odbcConn.Open();
             using var cmd = new OdbcCommand(sql, odbcConn);
+            cmd.CommandTimeout = 60;
             using var rdr = cmd.ExecuteReader();
             var excluded = new HashSet<long>();
             while (rdr.Read())
@@ -905,16 +909,18 @@ public static class DatabaseService
         }
 
         const string sql = """
+            SET NOCOUNT ON;
+            SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
             WITH FilteredDelays AS (
                 SELECT DISTINCT
                     P.TARGET_MACHINE AS MACHINE_OID,
                     J1.NAME AS DELAY_NAME,
                     J1.DELAYCATEGORY,
                     J1.DELAYCLASS_OID
-                FROM [mshist_rep].[dbo].[DELAY] AS P
-                LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] AS J1
+                FROM [mshist_rep].[dbo].[DELAY] AS P WITH (NOLOCK)
+                LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] AS J1 WITH (NOLOCK)
                     ON P.DELAYCLASS = J1.DELAYCLASS_OID
-                LEFT JOIN [msmodel_rep].[dbo].[DELAYCATEGORY] AS J3
+                LEFT JOIN [msmodel_rep].[dbo].[DELAYCATEGORY] AS J3 WITH (NOLOCK)
                     ON J1.DELAYCATEGORY = J3.DELAYCATEGORY_OID
                 WHERE P.STATUS = 3
             )
@@ -925,15 +931,17 @@ public static class DatabaseService
                 d.DELAYCATEGORY AS DelayCategory,
                 d.DELAYCLASS_OID AS DelayClassOid,
                 d.DELAY_NAME AS DelayClassName
-            FROM [msmodel_rep].[dbo].[MACHINE] m
+            FROM [msmodel_rep].[dbo].[MACHINE] m WITH (NOLOCK)
             LEFT JOIN FilteredDelays d ON d.MACHINE_OID = m.MACHINE_OID
             WHERE LEFT(UPPER(LTRIM(RTRIM(m.NAME))), 2) IN ('CB', 'HB', 'KB', 'CT', 'KT')
             ORDER BY m.NAME
+            OPTION (RECOMPILE);
             """;
 
         using var odbcConn = new OdbcConnection(cfg.SqlConnectionString);
         odbcConn.Open();
         using var odbcCmd = new OdbcCommand(sql, odbcConn);
+        odbcCmd.CommandTimeout = 60;
         using var odbcReader = odbcCmd.ExecuteReader();
 
         var cols = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -1051,5 +1059,89 @@ public static class DatabaseService
         }
 
         return rowsOut;
+    }
+
+    public static Dictionary<string, object?> GetHourlyRdpAvailability(AppConfig cfg, DateOnly reportDate)
+    {
+        string dateIso = reportDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        double startTs = LocalTs(cfg.Timezone, reportDate, TimeOnly.MinValue);
+        double endTs = LocalTs(cfg.Timezone, reportDate.AddDays(1), TimeOnly.MinValue);
+        var excludedOids = GetBdDays(cfg.DbFile, dateIso, dateIso).Select(x => x.Oid).ToHashSet();
+
+        var buckets = new Dictionary<(int Hour, string Dtype), (long OkCount, long TotalCount)>();
+        double latestCheckedAt = 0.0;
+
+        using (var conn = ConnectDb(cfg.DbFile))
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT checked_at, machine_oid, device_type, is_available
+                FROM ping_history
+                WHERE checked_at >= $start AND checked_at < $end
+                  AND device_type IN ('R', 'D', 'P')
+                """;
+            cmd.Parameters.AddWithValue("$start", startTs);
+            cmd.Parameters.AddWithValue("$end", endTs);
+
+            using var rdr = cmd.ExecuteReader();
+            while (rdr.Read())
+            {
+                double chk = rdr.GetDouble(0);
+                long oid = rdr.GetInt64(1);
+                string dtype = rdr.GetString(2);
+                bool isAvail = rdr.GetInt64(3) != 0;
+
+                if (chk > latestCheckedAt) latestCheckedAt = chk;
+                if (excludedOids.Contains(oid)) continue;
+
+                var utcDt = DateTimeOffset.FromUnixTimeSeconds((long)Math.Floor(chk)).UtcDateTime;
+                var localDt = TimeZoneInfo.ConvertTimeFromUtc(utcDt, cfg.Timezone);
+                int hr = Math.Clamp(localDt.Hour, 0, 23);
+
+                var key = (hr, dtype);
+                buckets.TryGetValue(key, out var cur);
+                buckets[key] = (cur.OkCount + (isAvail ? 1 : 0), cur.TotalCount + 1);
+            }
+        }
+
+        var hours = new List<Dictionary<string, object?>>(24);
+        for (int h = 0; h < 24; h++)
+        {
+            double? CalcPct(string dt)
+            {
+                if (!buckets.TryGetValue((h, dt), out var b) || b.TotalCount == 0) return null;
+                return Math.Round((b.OkCount * 100.0) / b.TotalCount, 2);
+            }
+
+            long samples = 0;
+            foreach (var dt in Constants.OverallDeviceTypes)
+            {
+                if (buckets.TryGetValue((h, dt), out var b)) samples += b.TotalCount;
+            }
+
+            hours.Add(new Dictionary<string, object?>
+            {
+                ["hour"] = h,
+                ["label"] = $"{h:D2}:00",
+                ["R"] = CalcPct("R"),
+                ["D"] = CalcPct("D"),
+                ["P"] = CalcPct("P"),
+                ["samples"] = samples
+            });
+        }
+
+        string? lastUpdateLocal = null;
+        if (latestCheckedAt > 0.0)
+        {
+            var dtUtc = DateTimeOffset.FromUnixTimeSeconds((long)Math.Floor(latestCheckedAt)).UtcDateTime;
+            lastUpdateLocal = TimeZoneInfo.ConvertTimeFromUtc(dtUtc, cfg.Timezone).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+        }
+
+        return new Dictionary<string, object?>
+        {
+            ["date"] = dateIso,
+            ["last_update"] = lastUpdateLocal,
+            ["hours"] = hours
+        };
     }
 }

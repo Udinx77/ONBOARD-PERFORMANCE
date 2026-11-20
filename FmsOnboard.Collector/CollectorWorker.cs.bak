@@ -63,12 +63,12 @@ public sealed class CollectorWorker(AppConfig cfg, ILogger<CollectorWorker> logg
     private async Task RunSatelliteLoopAsync(CancellationToken ct)
     {
         int refreshMins = Math.Max(1, cfg.GpsQueryRefreshMinutes);
-        var interval = TimeSpan.FromMinutes(refreshMins);
-        int maxGap = Math.Max(refreshMins * 180, cfg.MaxObservationGapSeconds);
+        var interval = TimeSpan.FromSeconds(5);
+        int maxGap = Math.Max(600, Math.Max(refreshMins * 180, cfg.MaxObservationGapSeconds));
 
         logger.LogInformation(
-            "[GPS-SAT] Worker satelit aktif (cek tiap {Mins} menit; <= {Red} merah, {YMin}-{YMax} kuning, > {YMax} hijau).",
-            refreshMins, cfg.GpsRedBelow, cfg.GpsRedBelow + 1, cfg.GpsYellowMax);
+            "[GPS-SAT] Worker satelit aktif (jeda 5 detik pasca-query; <= {Red} merah, {YMin}-{YMax} kuning, > {YMax} hijau).",
+            cfg.GpsRedBelow, cfg.GpsRedBelow + 1, cfg.GpsYellowMax);
 
         while (!ct.IsCancellationRequested)
         {

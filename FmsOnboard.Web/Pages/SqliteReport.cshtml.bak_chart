@@ -1,0 +1,1830 @@
+@page "/report/sqlite"
+@using System.Globalization
+@using Microsoft.Data.Sqlite
+@using FmsOnboard.Core
+@inject AppConfig Cfg
+@functions {
+    private sealed class DeviceAgg
+    {
+        public string IpAddress { get; set; } = "-";
+        public string Status { get; set; } = "N/A";
+        public double? PacketLossPct { get; set; }
+        public double UptimeSeconds { get; set; }
+        public double DowntimeSeconds { get; set; }
+        public double ExpectedSeconds { get; set; }
+        public double? AvailabilityPct => (UptimeSeconds + DowntimeSeconds) > 0.0
+            ? (UptimeSeconds / (UptimeSeconds + DowntimeSeconds)) * 100.0
+            : null;
+        public double CoveragePct => ExpectedSeconds > 0.0
+            ? Math.Min(100.0, ((UptimeSeconds + DowntimeSeconds) / ExpectedSeconds) * 100.0)
+            : 0.0;
+    }
+
+    private sealed class UnitAgg
+    {
+        public int Rank { get; set; }
+        public long MachineOid { get; set; }
+        public string MachineName { get; set; } = "";
+        public bool Excluded { get; set; }
+        public Dictionary<string, DeviceAgg> Devices { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public double? OverallPct { get; set; }
+        public double? RadioPct { get; set; }
+        public double? DisplayPct { get; set; }
+        public double? PlePct { get; set; }
+        public double? GpsPct { get; set; }
+        public double OverallObservedSeconds { get; set; }
+    }
+
+    private static readonly object _cacheLock = new();
+    private static DateTime _cacheExpiresUtc = DateTime.MinValue;
+    private static string _cacheKey = "";
+    private static (
+        Dictionary<string, (double? Avail, double Cov, int Targets)> Summary,
+        List<UnitAgg> Units,
+        List<UnitAgg> Highest,
+        List<UnitAgg> Lowest,
+        List<UnitAgg> Loader,
+        List<UnitAgg> Hauler,
+        DateOnly StartDate,
+        DateOnly EndDate,
+        int TotalDays,
+        int ExcludedLatest
+    )? _cachedAll;
+
+    private static string? GetStr(IDictionary<string, object?> d, string k) =>
+        d.TryGetValue(k, out var v) ? v?.ToString() : null;
+
+    private static double GetDbl(IDictionary<string, object?> d, string k, double def = 0.0) =>
+        d.TryGetValue(k, out var v) && v is not null ? Convert.ToDouble(v, CultureInfo.InvariantCulture) : def;
+
+    private static double? GetNullableDbl(IDictionary<string, object?> d, string k) =>
+        d.TryGetValue(k, out var v) && v is not null ? Convert.ToDouble(v, CultureInfo.InvariantCulture) : null;
+
+    private static long GetLong(IDictionary<string, object?> d, string k, long def = 0) =>
+        d.TryGetValue(k, out var v) && v is not null ? Convert.ToInt64(v, CultureInfo.InvariantCulture) : def;
+
+    private static bool GetBool(IDictionary<string, object?> d, string k) =>
+        d.TryGetValue(k, out var v) && v is bool b && b;
+
+    private static string FmtPct(double? val) => val.HasValue ? $"{val.Value:F2}%" : "N/A";
+
+    private static string PctTone(double? val)
+    {
+        if (!val.HasValue) return "neutral";
+        if (val.Value >= 90.0) return "ok";
+        if (val.Value >= 75.0) return "warn";
+        return "crit";
+    }
+
+    private static string TypeName(string code) => code switch
+    {
+        "R" => "Radio",
+        "D" => "Display",
+        "P" => "PLE",
+        "G" => "GPS",
+        _ => code
+    };
+
+    private static string UnitPrefix(string name)
+    {
+        var clean = (name ?? "").Trim().ToUpperInvariant();
+        return clean.Length >= 2 ? clean[..2] : clean;
+    }
+
+    private static bool IsLoader(string name) => UnitPrefix(name) is "CB" or "HB" or "KB";
+    private static bool IsHauler(string name) => UnitPrefix(name) is "CT" or "KT";
+}
+@{
+    var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, Cfg.Timezone));
+    var dateParam = Request.Query["date"].ToString().Trim();
+    bool hasCustomDate = DateOnly.TryParseExact(dateParam, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedDate);
+    var selectedDate = hasCustomDate ? parsedDate : today;
+    var selectedDateStr = selectedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    Dictionary<string, object?>? monthly = null;
+    string? error = null;
+
+    var overallCodes = new[] { "R", "D", "P" };
+    var allCodes = new[] { "R", "D", "P", "G" };
+    var summaryCards = new Dictionary<string, (double? Avail, double Cov, int Targets)>(StringComparer.OrdinalIgnoreCase);
+    var unitList = new List<UnitAgg>();
+    var topHighest = new List<UnitAgg>();
+    var topLowest = new List<UnitAgg>();
+    var topLoader = new List<UnitAgg>();
+    var topHauler = new List<UnitAgg>();
+    DateOnly startRunDate = today;
+    DateOnly endRunDate = today;
+    int totalDaysCount = 1;
+    int excludedLatestCount = 0;
+
+    try
+    {
+        monthly = MonthlyReportService.BuildMonthlyContext(Cfg);
+
+        string reqKey = hasCustomDate ? selectedDateStr : $"ALL:{today:yyyy-MM-dd}";
+        lock (_cacheLock)
+        {
+            if (_cachedAll is not null && _cacheKey == reqKey && DateTime.UtcNow < _cacheExpiresUtc)
+            {
+                var c = _cachedAll.Value;
+                summaryCards = c.Summary;
+                unitList = c.Units;
+                topHighest = c.Highest;
+                topLowest = c.Lowest;
+                topLoader = c.Loader;
+                topHauler = c.Hauler;
+                startRunDate = c.StartDate;
+                endRunDate = c.EndDate;
+                totalDaysCount = c.TotalDays;
+                excludedLatestCount = c.ExcludedLatest;
+                goto RenderPage;
+            }
+        }
+
+        var targetDates = new SortedSet<DateOnly>();
+        if (hasCustomDate)
+        {
+            targetDates.Add(selectedDate);
+        }
+        else if (System.IO.File.Exists(Cfg.DbFile))
+        {
+            using var conn = new SqliteConnection($"Data Source={Cfg.DbFile};Mode=ReadOnly");
+            conn.Open();
+            var tables = new List<string>();
+            using (var cmdT = conn.CreateCommand())
+            {
+                cmdT.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%avail%';";
+                using var rT = cmdT.ExecuteReader();
+                while (rT.Read()) tables.Add(rT.GetString(0));
+            }
+            foreach (var tbl in tables)
+            {
+                string? dateCol = null;
+                using (var cmdC = conn.CreateCommand())
+                {
+                    cmdC.CommandText = $"PRAGMA table_info([{tbl}]);";
+                    using var rC = cmdC.ExecuteReader();
+                    while (rC.Read())
+                    {
+                        var col = rC.GetString(1);
+                        if (col.Equals("date", StringComparison.OrdinalIgnoreCase) ||
+                            col.Equals("day", StringComparison.OrdinalIgnoreCase) ||
+                            col.Equals("report_date", StringComparison.OrdinalIgnoreCase))
+                        {
+                            dateCol = col;
+                            break;
+                        }
+                    }
+                }
+                if (dateCol is not null)
+                {
+                    using var cmdD = conn.CreateCommand();
+                    cmdD.CommandText = $"SELECT DISTINCT [{dateCol}] FROM [{tbl}] WHERE [{dateCol}] IS NOT NULL;";
+                    using var rD = cmdD.ExecuteReader();
+                    while (rD.Read())
+                    {
+                        var raw = rD.GetValue(0)?.ToString()?.Trim();
+                        if (DateOnly.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt) && dt <= today)
+                            targetDates.Add(dt);
+                    }
+                }
+            }
+        }
+        if (targetDates.Count == 0) targetDates.Add(today);
+
+        startRunDate = targetDates.Min;
+        endRunDate = targetDates.Max;
+        totalDaysCount = targetDates.Count;
+
+        var aggMap = new Dictionary<long, UnitAgg>();
+        int latestTargetCount = 0;
+
+        foreach (var dt in targetDates)
+        {
+            var dayReport = AvailabilityReportService.BuildReport(Cfg, dt);
+            if (!dayReport.TryGetValue("units", out var unitsObj) || unitsObj is not List<Dictionary<string, object?>> dayUnits)
+                continue;
+
+            if (dt == endRunDate)
+            {
+                excludedLatestCount = dayUnits.Count(u => GetBool(u, "excluded"));
+                latestTargetCount = dayUnits.Count(u => !GetBool(u, "excluded"));
+            }
+
+            foreach (var u in dayUnits)
+            {
+                long oid = GetLong(u, "machine_oid");
+                if (oid == 0) continue;
+                string mName = GetStr(u, "machine_name") ?? $"OID-{oid}";
+                bool excl = GetBool(u, "excluded");
+                int rankVal = (int)GetLong(u, "rank");
+
+                if (!aggMap.TryGetValue(oid, out var uAgg))
+                {
+                    uAgg = new UnitAgg { MachineOid = oid, MachineName = mName, Rank = rankVal };
+                    aggMap[oid] = uAgg;
+                }
+
+                if (dt == endRunDate || uAgg.Rank == 0)
+                {
+                    uAgg.MachineName = mName;
+                    uAgg.Excluded = excl;
+                    if (rankVal > 0) uAgg.Rank = rankVal;
+                }
+
+                if (!u.TryGetValue("devices", out var devsObj) || devsObj is not Dictionary<string, Dictionary<string, object?>> devs)
+                    continue;
+
+                foreach (var code in allCodes)
+                {
+                    if (!devs.TryGetValue(code, out var d)) continue;
+                    if (!uAgg.Devices.TryGetValue(code, out var dAgg))
+                    {
+                        dAgg = new DeviceAgg();
+                        uAgg.Devices[code] = dAgg;
+                    }
+
+                    double up = GetDbl(d, "uptime_seconds");
+                    double down = GetDbl(d, "downtime_seconds");
+                    double obs = GetDbl(d, "observed_seconds", up + down);
+                    double covPct = GetDbl(d, "coverage_pct");
+                    double exp = covPct > 0.0 ? (obs / (covPct / 100.0)) : 86400.0;
+
+                    dAgg.UptimeSeconds += up;
+                    dAgg.DowntimeSeconds += down;
+                    dAgg.ExpectedSeconds += exp;
+
+                    if (dt == endRunDate)
+                    {
+                        dAgg.IpAddress = GetStr(d, "ip_address") ?? "-";
+                        dAgg.Status = GetStr(d, "status") ?? "N/A";
+                        dAgg.PacketLossPct = GetNullableDbl(d, "packet_loss_pct");
+                    }
+                }
+            }
+        }
+
+        unitList = aggMap.Values
+            .OrderBy(u => u.MachineName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        for (int i = 0; i < unitList.Count; i++)
+        {
+            var u = unitList[i];
+            if (u.Rank == 0) u.Rank = i + 1;
+
+            double ovUp = 0.0;
+            double ovDown = 0.0;
+            foreach (var code in overallCodes)
+            {
+                if (u.Devices.TryGetValue(code, out var dev))
+                {
+                    ovUp += dev.UptimeSeconds;
+                    ovDown += dev.DowntimeSeconds;
+                }
+            }
+            u.OverallObservedSeconds = ovUp + ovDown;
+            u.OverallPct = u.OverallObservedSeconds > 0.0 ? (ovUp / u.OverallObservedSeconds) * 100.0 : null;
+            u.RadioPct = u.Devices.TryGetValue("R", out var rDev) ? rDev.AvailabilityPct : null;
+            u.DisplayPct = u.Devices.TryGetValue("D", out var dDev) ? dDev.AvailabilityPct : null;
+            u.PlePct = u.Devices.TryGetValue("P", out var pDev) ? pDev.AvailabilityPct : null;
+            u.GpsPct = u.Devices.TryGetValue("G", out var gDev) ? gDev.AvailabilityPct : null;
+        }
+
+        if (latestTargetCount == 0) latestTargetCount = unitList.Count;
+
+        foreach (var code in allCodes)
+        {
+            double sumUp = 0.0, sumDown = 0.0, sumExp = 0.0;
+            foreach (var u in unitList)
+            {
+                if (u.Devices.TryGetValue(code, out var dev))
+                {
+                    sumUp += dev.UptimeSeconds;
+                    sumDown += dev.DowntimeSeconds;
+                    sumExp += dev.ExpectedSeconds;
+                }
+            }
+            double? av = (sumUp + sumDown) > 0.0 ? (sumUp / (sumUp + sumDown)) * 100.0 : null;
+            double cv = sumExp > 0.0 ? Math.Min(100.0, ((sumUp + sumDown) / sumExp) * 100.0) : 0.0;
+            summaryCards[code] = (av, cv, latestTargetCount);
+        }
+
+        double combUp = 0.0, combDown = 0.0, combExp = 0.0;
+        foreach (var code in overallCodes)
+        {
+            foreach (var u in unitList)
+            {
+                if (u.Devices.TryGetValue(code, out var dev))
+                {
+                    combUp += dev.UptimeSeconds;
+                    combDown += dev.DowntimeSeconds;
+                    combExp += dev.ExpectedSeconds;
+                }
+            }
+        }
+        double? combAvail = (combUp + combDown) > 0.0 ? (combUp / (combUp + combDown)) * 100.0 : null;
+        double combCov = combExp > 0.0 ? Math.Min(100.0, ((combUp + combDown) / combExp) * 100.0) : 0.0;
+        summaryCards["Overall"] = (combAvail, combCov, latestTargetCount);
+
+        topHighest = unitList
+            .Where(u => u.OverallPct.HasValue)
+            .OrderByDescending(u => u.OverallPct!.Value)
+            .ThenByDescending(u => u.OverallObservedSeconds)
+            .ThenBy(u => u.MachineName, StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .ToList();
+
+        topLowest = unitList
+            .OrderBy(u => u.OverallPct ?? -1.0)
+            .ThenBy(u => u.OverallObservedSeconds)
+            .ThenBy(u => u.MachineName, StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .ToList();
+
+        topLoader = unitList
+            .Where(u => IsLoader(u.MachineName) && u.OverallPct.HasValue)
+            .OrderByDescending(u => u.OverallPct!.Value)
+            .ThenByDescending(u => u.OverallObservedSeconds)
+            .ThenBy(u => u.MachineName, StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .ToList();
+
+        topHauler = unitList
+            .Where(u => IsHauler(u.MachineName) && u.OverallPct.HasValue)
+            .OrderByDescending(u => u.OverallPct!.Value)
+            .ThenByDescending(u => u.OverallObservedSeconds)
+            .ThenBy(u => u.MachineName, StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .ToList();
+
+        lock (_cacheLock)
+        {
+            _cacheKey = reqKey;
+            _cacheExpiresUtc = DateTime.UtcNow.AddSeconds(60);
+            _cachedAll = (summaryCards, unitList, topHighest, topLowest, topLoader, topHauler, startRunDate, endRunDate, totalDaysCount, excludedLatestCount);
+        }
+
+        RenderPage:;
+    }
+    catch (Exception ex)
+    {
+        error = ex.Message;
+        try { monthly = MonthlyReportService.BuildMonthlyContext(Cfg); } catch { }
+    }
+}
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Availability Dashboard - FMS Onboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700&family=JetBrains+Mono:wght@600;700;800&display=swap" rel="stylesheet" />
+  <script src="/js/signalr.min.js"></script>
+  <style>
+    :root {
+      --bg-canvas: #000000;
+      --bg-page: #000000;
+      --bg-topbar: #313131;
+      --bg-card: #2c2c2c;
+      --bg-card-elevated: #3a3a3a;
+      --bg-card-hover: #3b3b3b;
+      --border-subtle: rgba(133, 133, 133, 0.658);
+      --border-hover: rgba(148, 163, 184, 0.36);
+
+      --text-primary: #ffffff;
+      --text-secondary: #e2e8f0;
+      --text-muted: #a3a3a3;
+
+      --ok: #2dff37;
+      --ok-bg: rgba(68, 170, 0, 0.24);
+      --ok-border: rgba(52, 211, 20, 0.836);
+      --ok-text: #9aff86;
+
+      --warn: #fff126;
+      --warn-bg: rgba(161, 137, 0, 0.24);
+      --warn-border: rgba(209, 188, 0, 0.822);
+      --warn-text: #ffeb55;
+
+      --crit: #fc2020;
+      --crit-bg: rgba(199, 0, 0, 0.28);
+      --crit-border: rgba(226, 0, 0, 0.925);
+      --crit-text: #ff6b6b;
+
+      --neutral-bg: rgba(148, 163, 184, 0.12);
+      --neutral-border: rgba(148, 163, 184, 0.34);
+      --neutral-text: #cbd5e1;
+
+      --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    *:focus-visible {
+      outline: 2px solid var(--ok-border);
+      outline-offset: 2px;
+    }
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 54px;
+      z-index: 45;
+      background: var(--bg-topbar);
+      border-right: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      transition: width 0.18s ease;
+      overflow: hidden;
+    }
+    .sidebar.expanded { width: 224px; }
+    .sidebar-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px;
+      min-height: 55px;
+      border-bottom: 1px solid var(--border-subtle);
+      flex-shrink: 0;
+    }
+    .sidebar-toggle {
+      width: 44px;
+      height: 44px;
+      flex-shrink: 0;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .sidebar-toggle:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+    }
+    .sidebar-brand {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 0.14s ease;
+    }
+    .sidebar.expanded .sidebar-brand { opacity: 1; }
+    .sidebar-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 5px;
+    }
+    .sidebar-link {
+      min-height: 44px;
+      padding: 0 12px;
+      border-radius: 7px;
+      border: 1px solid transparent;
+      color: var(--text-secondary);
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .sidebar-link:hover {
+      background: var(--bg-card);
+      border-color: var(--border-subtle);
+      color: var(--text-primary);
+    }
+    .sidebar-link.active {
+      background: var(--bg-card);
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+      font-weight: 700;
+    }
+    .sidebar-ico { width: 18px; height: 18px; flex-shrink: 0; }
+    .sidebar-lbl {
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0;
+      transition: opacity 0.14s ease;
+    }
+    .sidebar.expanded .sidebar-lbl { opacity: 1; }
+    .sidebar-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 40;
+    }
+
+    .app-main {
+      margin-left: 54px;
+      width: calc(100% - 54px);
+      min-height: 100vh;
+      transition: margin-left 0.18s ease, width 0.18s ease;
+    }
+    body.sidebar-open .app-main {
+      margin-left: 224px;
+      width: calc(100% - 224px);
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      width: 100%;
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 10px 18px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .title-block h1 {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .sub-line {
+      margin-top: 3px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ok-border);
+      display: inline-block;
+    }
+
+    .header-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .ctrl-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn, .ctrl-input, .ctrl-select {
+      min-height: 44px;
+      padding: 0 12px;
+      border-radius: 7px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+    .btn:hover, .ctrl-input:hover, .ctrl-select:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+    }
+    .btn-export {
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+      background: var(--ok-bg);
+    }
+    .btn-export:hover {
+      background: rgba(34, 197, 94, 0.22);
+      border-color: var(--ok-text);
+    }
+    .btn-active {
+      border-color: var(--ok-border);
+      color: var(--ok-text);
+    }
+
+    .container {
+      width: 100%;
+      padding: 16px 18px 28px;
+    }
+
+    .err-banner {
+      background: var(--crit-bg);
+      border: 1px solid var(--crit-border);
+      color: var(--crit-text);
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: 1.16fr repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+      align-items: stretch;
+    }
+    .kpi-card {
+      background: var(--bg-card);
+      border: 1.5px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      transition: transform 0.16s ease, border-color 0.2s ease, background 0.2s ease;
+    }
+    .kpi-card:hover {
+      transform: translateY(-1px);
+      border-color: var(--border-hover);
+    }
+
+    /* Warna dinamis berdasarkan hasil availability untuk SEMUA 5 card KPI */
+    .kpi-card.tone-card-ok {
+      border-color: var(--ok-border);
+      background: linear-gradient(180deg, rgba(45, 255, 55, 0.11) 0%, #242a25 100%);
+    }
+    .kpi-card.tone-card-warn {
+      border-color: var(--warn-border);
+      background: linear-gradient(180deg, rgba(255, 241, 38, 0.11) 0%, #2b2920 100%);
+    }
+    .kpi-card.tone-card-crit {
+      border-color: var(--crit-border);
+      background: linear-gradient(180deg, rgba(252, 32, 32, 0.13) 0%, #2c2121 100%);
+    }
+    .kpi-card.tone-card-neutral {
+      border-color: var(--neutral-border);
+      background: linear-gradient(180deg, rgba(148, 163, 184, 0.08) 0%, #262626 100%);
+    }
+
+    .kpi-head {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .kpi-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-primary);
+    }
+    .kpi-tag {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: rgba(0, 0, 0, 0.45);
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    .donut-wrap {
+      position: relative;
+      width: 108px;
+      height: 108px;
+      display: grid;
+      place-items: center;
+      margin: 2px 0;
+      flex-shrink: 0;
+    }
+    .kpi-card.primary .donut-wrap {
+      width: 120px;
+      height: 120px;
+    }
+    .donut-svg {
+      width: 100%;
+      height: 100%;
+      transform: rotate(-90deg);
+      overflow: visible;
+    }
+    .donut-track {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.11);
+      stroke-width: 9;
+    }
+    .kpi-card.primary .donut-track {
+      stroke-width: 10;
+    }
+    .donut-fill {
+      fill: none;
+      stroke-width: 9;
+      stroke-linecap: round;
+      transition: stroke-dashoffset 0.55s cubic-bezier(0.22, 1, 0.36, 1), stroke 0.2s ease;
+    }
+    .kpi-card.primary .donut-fill {
+      stroke-width: 10;
+    }
+    .donut-fill.stroke-ok { stroke: var(--ok); }
+    .donut-fill.stroke-warn { stroke: var(--warn); }
+    .donut-fill.stroke-crit { stroke: var(--crit); }
+    .donut-fill.stroke-neutral { stroke: var(--neutral-border); }
+
+    .donut-center {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      pointer-events: none;
+      padding: 0 10px;
+    }
+    .donut-val {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 17px;
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+    }
+    .kpi-card.primary .donut-val {
+      font-size: 20px;
+    }
+    .donut-state {
+      margin-top: 3px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+
+    .kpi-foot {
+      width: 100%;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255, 255, 255, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      color: var(--text-secondary);
+    }
+    .kpi-foot strong {
+      color: var(--text-primary);
+      font-weight: 700;
+    }
+
+    /* Grafik Trend Availability R, D, P (100% - 0% vs Jam) */
+    .trend-panel {
+      background: #1c1c1c;
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 14px 16px 12px;
+      margin-bottom: 20px;
+    }
+    .trend-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .trend-title-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .trend-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-primary);
+    }
+    .trend-sub {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .trend-legend {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 14px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .legend-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 5px;
+      background: #262626;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    .legend-swatch {
+      width: 12px;
+      height: 3px;
+      border-radius: 2px;
+      display: inline-block;
+    }
+    .trend-canvas-wrap {
+      position: relative;
+      width: 100%;
+    }
+    .trend-svg {
+      width: 100%;
+      height: 235px;
+      display: block;
+      overflow: visible;
+    }
+    .trend-grid-line {
+      stroke: rgba(255, 255, 255, 0.09);
+      stroke-width: 1;
+    }
+    .trend-grid-line.zero {
+      stroke: rgba(255, 255, 255, 0.22);
+    }
+    .trend-axis-label {
+      fill: #a3a3a3;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .trend-line {
+      fill: none;
+      stroke-width: 2.3;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .trend-line-r { stroke: #38bdf8; }
+    .trend-line-d { stroke: #fbbf24; }
+    .trend-line-p { stroke: #c084fc; }
+    .trend-tooltip {
+      position: absolute;
+      top: 8px;
+      right: 10px;
+      background: rgba(18, 18, 18, 0.94);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-primary);
+      pointer-events: none;
+      display: none;
+      gap: 10px;
+      align-items: center;
+      z-index: 5;
+    }
+    .trend-tooltip.visible {
+      display: inline-flex;
+    }
+    .tone-ok { color: var(--ok-text); }
+    .tone-warn { color: var(--warn-text); }
+    .tone-crit { color: var(--crit-text); }
+    .tone-neutral { color: var(--neutral-text); }
+
+    .section-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .ranking-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .rank-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .rank-header {
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .rank-header h2 {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .rank-badge {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+      color: var(--text-secondary);
+    }
+    .rank-badge.ok { border-color: var(--ok-border); color: var(--ok-text); background: var(--ok-bg); }
+    .rank-badge.crit { border-color: var(--crit-border); color: var(--crit-text); background: var(--crit-bg); }
+
+    .table-scroll {
+      width: 100%;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border-subtle);
+      white-space: nowrap;
+    }
+    th {
+      background: #242424;
+      color: var(--text-secondary);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      text-align: left;
+    }
+    th.num, td.num {
+      text-align: right;
+      font-family: var(--font-mono);
+    }
+    tbody tr:hover {
+      background: var(--bg-card-hover);
+    }
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+    .unit-cell {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .na-pill {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--neutral-bg);
+      border: 1px solid var(--neutral-border);
+      color: var(--neutral-text);
+    }
+    .bd-pill {
+      display: inline-block;
+      margin-left: 5px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--crit-bg);
+      border: 1px solid var(--crit-border);
+      color: var(--crit-text);
+    }
+
+    .detail-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .filter-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+    .search-input {
+      min-height: 44px;
+      min-width: 220px;
+      padding: 0 12px;
+      border-radius: 7px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      font-size: 12px;
+    }
+    .detail-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 62vh;
+    }
+    .detail-box th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .status-badge {
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      border: 1px solid transparent;
+    }
+    .Green { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-text); }
+    .Yellow { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+    .Orange { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+    .Red { background: var(--crit-bg); border-color: var(--crit-border); color: var(--crit-text); }
+
+    .empty-row {
+      text-align: center;
+      color: var(--text-muted);
+      padding: 18px 10px;
+    }
+
+    @@media (max-width: 1180px) {
+      .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .ranking-grid { grid-template-columns: 1fr; }
+    }
+    @@media (max-width: 768px) {
+      .sidebar.expanded { box-shadow: 6px 0 24px rgba(0, 0, 0, 0.75); }
+      body.sidebar-open .app-main { margin-left: 54px; width: calc(100% - 54px); }
+      body.sidebar-open .sidebar-backdrop { display: block; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @@media (max-width: 540px) {
+      .kpi-grid { grid-template-columns: 1fr; }
+      .container { padding: 12px; }
+    }
+    @@media (prefers-reduced-motion: reduce) {
+      .sidebar, .sidebar-brand, .sidebar-lbl, .app-main { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <aside id="appSidebar" class="sidebar" aria-label="Menu Navigasi Utama">
+    <div class="sidebar-top">
+      <button type="button" id="sidebarToggle" class="sidebar-toggle" aria-expanded="false" aria-controls="sidebarNav" aria-label="Buka atau tutup sidebar" title="Menu">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="6" x2="21" y2="6"></line>
+          <line x1="3" y1="12" x2="21" y2="12"></line>
+          <line x1="3" y1="18" x2="21" y2="18"></line>
+        </svg>
+      </button>
+      <span class="sidebar-brand">NAVIGASI</span>
+    </div>
+    <nav id="sidebarNav" class="sidebar-nav">
+      <a class="sidebar-link" href="/" title="Live Telemetry">
+        <svg class="sidebar-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+        <span class="sidebar-lbl">Live Telemetry</span>
+      </a>
+      <a class="sidebar-link active" href="/report/sqlite" aria-current="page" title="Availability Dashboard">
+        <svg class="sidebar-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="7" height="9" rx="1"></rect>
+          <rect x="14" y="3" width="7" height="5" rx="1"></rect>
+          <rect x="14" y="12" width="7" height="9" rx="1"></rect>
+          <rect x="3" y="16" width="7" height="5" rx="1"></rect>
+        </svg>
+        <span class="sidebar-lbl">Availability Dashboard</span>
+      </a>
+    </nav>
+  </aside>
+  <div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+
+  <div class="app-main">
+    <header class="topbar">
+      <div class="title-block">
+        <h1>FMS Onboard Availability</h1>
+        <div class="sub-line">
+          <span class="live-dot" aria-hidden="true"></span>
+          @if (hasCustomDate)
+          {
+            <span>Periode: @selectedDateStr (1 hari)</span>
+          }
+          else
+          {
+            <span>Periode Awal Running: @startRunDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) s/d @endRunDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) (@totalDaysCount hari)</span>
+          }
+          <span>| Total @unitList.Count unit</span>
+          <span>| Overall = Radio + Display + PLE (GPS terpisah)</span>
+        </div>
+      </div>
+
+      <div class="header-actions" aria-label="Filter Periode dan Export Data">
+        <div class="ctrl-group">
+          <a class="btn @(!hasCustomDate ? "btn-active" : "")" href="/report/sqlite">Awal Running</a>
+          <form method="get" action="/report/sqlite" class="ctrl-group">
+            <label for="filterDate" style="position:absolute;width:1px;height:1px;overflow:hidden;">Tanggal Laporan</label>
+            <input id="filterDate" class="ctrl-input" type="date" name="date" value="@selectedDateStr" />
+            <button class="btn" type="submit">Tampilkan</button>
+          </form>
+        </div>
+
+        <div class="ctrl-group">
+          <a class="btn btn-export" href="/export/availability.xlsx?date=@selectedDateStr">Export XLSX</a>
+          <a class="btn" href="/export/availability.pdf?date=@selectedDateStr">Export PDF</a>
+          @if (monthly is not null && monthly.TryGetValue("months", out var mObj) && mObj is List<Dictionary<string, object?>> mList && mList.Count > 0)
+          {
+            <form method="get" action="/export/availability_monthly.xlsx" class="ctrl-group">
+              <label for="exportMonth" style="position:absolute;width:1px;height:1px;overflow:hidden;">Bulan Export</label>
+              <select id="exportMonth" class="ctrl-select" name="month">
+                @foreach (var m in mList)
+                {
+                  <option value="@GetStr(m, "month")">@GetStr(m, "month") (@GetLong(m, "days") hari)</option>
+                }
+              </select>
+              <button class="btn" type="submit">Export Bulanan</button>
+            </form>
+          }
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      @if (!string.IsNullOrEmpty(error))
+      {
+        <div class="err-banner" role="alert">@error</div>
+      }
+
+      @if (summaryCards.Count > 0)
+      {
+        var orderedKpis = new[]
+        {
+          (Key: "Overall", Title: "Availability Keseluruhan", Tag: "R + D + P", Primary: true),
+          (Key: "R",       Title: "Radio",               Tag: "R",     Primary: false),
+          (Key: "D",       Title: "Display",             Tag: "D",     Primary: false),
+          (Key: "P",       Title: "PLE",                 Tag: "P",     Primary: false),
+          (Key: "G",       Title: "GPS Satelit",         Tag: "G",     Primary: false)
+        };
+
+        <section aria-label="Ringkasan Availability Perangkat">
+          <div class="kpi-grid">
+            @foreach (var kpi in orderedKpis)
+            {
+              summaryCards.TryGetValue(kpi.Key, out var stat);
+              var tone = PctTone(stat.Avail);
+              var stateLabel = tone switch
+              {
+                "ok" => "OPTIMAL",
+                "warn" => "PERHATIAN",
+                "crit" => "KRITIS",
+                _ => "N/A"
+              };
+              double pctClamped = stat.Avail.HasValue ? Math.Clamp(stat.Avail.Value, 0.0, 100.0) : 0.0;
+              const double radius = 44.0;
+              double circumference = 2.0 * Math.PI * radius;
+              double dashOffset = stat.Avail.HasValue
+                ? circumference * (1.0 - (pctClamped / 100.0))
+                : circumference;
+              string circStr = circumference.ToString("F2", CultureInfo.InvariantCulture);
+              string offsetStr = dashOffset.ToString("F2", CultureInfo.InvariantCulture);
+
+              <article class="kpi-card tone-card-@tone @(kpi.Primary ? "primary" : "")" data-kpi-key="@kpi.Key">
+                <div class="kpi-head">
+                  <span class="kpi-label">@kpi.Title</span>
+                  <span class="kpi-tag">@kpi.Tag</span>
+                </div>
+
+                <div class="donut-wrap" role="img" aria-label="@($"{kpi.Title} availability {FmtPct(stat.Avail)}, status {stateLabel}")">
+                  <svg class="donut-svg" viewBox="0 0 104 104" aria-hidden="true">
+                    <circle class="donut-track" cx="52" cy="52" r="44"></circle>
+                    <circle class="donut-fill stroke-@tone"
+                            cx="52"
+                            cy="52"
+                            r="44"
+                            stroke-dasharray="@circStr"
+                            stroke-dashoffset="@offsetStr"></circle>
+                  </svg>
+                  <div class="donut-center">
+                    <span class="donut-val tone-@tone">@FmtPct(stat.Avail)</span>
+                    <span class="donut-state">@stateLabel</span>
+                  </div>
+                </div>
+
+                <div class="kpi-foot">
+                  <span>Cov <strong class="kpi-cov">@($"{stat.Cov:F1}%")</strong></span>
+                  <span>Target <strong class="kpi-targets">@stat.Targets</strong> unit</span>
+                </div>
+              </article>
+            }
+          </div>
+        </section>
+
+        <section class="trend-panel" aria-label="Grafik Availability Perangkat R, D, P Per Jam">
+          <div class="trend-head">
+            <div class="trend-title-wrap">
+              <h2 class="trend-title">Tren Availability Perangkat (Radio, Display, PLE)</h2>
+              <span id="trendMetaText" class="trend-sub">Rentang 00:00 - 23:00 | Tanggal @selectedDateStr | Menyelaraskan hasil ping terbaru...</span>
+            </div>
+            <div class="trend-legend" aria-label="Legenda Perangkat">
+              <span class="legend-pill" style="color:#38bdf8;"><span class="legend-swatch" style="background:#38bdf8;"></span>R (Radio): <strong id="legLatestR">--</strong></span>
+              <span class="legend-pill" style="color:#fbbf24;"><span class="legend-swatch" style="background:#fbbf24;"></span>D (Display): <strong id="legLatestD">--</strong></span>
+              <span class="legend-pill" style="color:#c084fc;"><span class="legend-swatch" style="background:#c084fc;"></span>P (PLE): <strong id="legLatestP">--</strong></span>
+            </div>
+          </div>
+
+          <div class="trend-canvas-wrap">
+            <div id="trendTooltip" class="trend-tooltip" role="status"></div>
+            <svg id="rdpTrendSvg" class="trend-svg" viewBox="0 0 1080 235" preserveAspectRatio="none" role="img" aria-label="Grafik garis availability Radio, Display, dan PLE dari 100 persen hingga 0 persen berdasarkan jam"></svg>
+          </div>
+        </section>
+        <section aria-label="Ranking Availability Unit">
+          <div class="section-title">
+            <span>Ranking Top 10 Availability Unit (Sejak Awal Running)</span>
+            <span>BD/Antri Terkini: @excludedLatestCount unit</span>
+          </div>
+
+          <div class="ranking-grid">
+            <article class="rank-card">
+              <div class="rank-header">
+                <h2>Top 10 Overall Availability Tertinggi</h2>
+                <span class="rank-badge ok">TERTINGGI</span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="num">#</th>
+                      <th>Unit</th>
+                      <th class="num">Radio</th>
+                      <th class="num">Display</th>
+                      <th class="num">PLE</th>
+                      <th class="num">GPS</th>
+                      <th class="num">Overall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @if (topHighest.Count == 0)
+                    {
+                      <tr><td colspan="7" class="empty-row">Belum ada data availability unit.</td></tr>
+                    }
+                    else
+                    {
+                      for (int i = 0; i < topHighest.Count; i++)
+                      {
+                        var u = topHighest[i];
+                        <tr>
+                          <td class="num">@(i + 1)</td>
+                          <td class="unit-cell">@u.MachineName@if (u.Excluded) { <span class="bd-pill">BD</span> }</td>
+                          <td class="num">@FmtPct(u.RadioPct)</td>
+                          <td class="num">@FmtPct(u.DisplayPct)</td>
+                          <td class="num">@FmtPct(u.PlePct)</td>
+                          <td class="num">@FmtPct(u.GpsPct)</td>
+                          <td class="num"><strong class="tone-@PctTone(u.OverallPct)">@FmtPct(u.OverallPct)</strong></td>
+                        </tr>
+                      }
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="rank-card">
+              <div class="rank-header">
+                <h2>Top 10 Overall Availability Terendah</h2>
+                <span class="rank-badge crit">TERENDAH / N/A</span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="num">#</th>
+                      <th>Unit</th>
+                      <th class="num">Radio</th>
+                      <th class="num">Display</th>
+                      <th class="num">PLE</th>
+                      <th class="num">GPS</th>
+                      <th class="num">Overall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @if (topLowest.Count == 0)
+                    {
+                      <tr><td colspan="7" class="empty-row">Belum ada data unit.</td></tr>
+                    }
+                    else
+                    {
+                      for (int i = 0; i < topLowest.Count; i++)
+                      {
+                        var u = topLowest[i];
+                        <tr>
+                          <td class="num">@(i + 1)</td>
+                          <td class="unit-cell">
+                            @u.MachineName
+                            @if (!u.OverallPct.HasValue) { <span class="na-pill">N/A</span> }
+                            @if (u.Excluded) { <span class="bd-pill">BD</span> }
+                          </td>
+                          <td class="num">@FmtPct(u.RadioPct)</td>
+                          <td class="num">@FmtPct(u.DisplayPct)</td>
+                          <td class="num">@FmtPct(u.PlePct)</td>
+                          <td class="num">@FmtPct(u.GpsPct)</td>
+                          <td class="num">
+                            @if (u.OverallPct.HasValue)
+                            {
+                              <strong class="tone-@PctTone(u.OverallPct)">@FmtPct(u.OverallPct)</strong>
+                            }
+                            else
+                            {
+                              <span class="na-pill">N/A</span>
+                            }
+                          </td>
+                        </tr>
+                      }
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="rank-card">
+              <div class="rank-header">
+                <h2>Top 10 Loader Good Availability Overall</h2>
+                <span class="rank-badge ok">CB / HB / KB</span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="num">#</th>
+                      <th>Unit</th>
+                      <th class="num">Radio</th>
+                      <th class="num">Display</th>
+                      <th class="num">PLE</th>
+                      <th class="num">GPS</th>
+                      <th class="num">Overall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @if (topLoader.Count == 0)
+                    {
+                      <tr><td colspan="7" class="empty-row">Belum ada data availability Loader.</td></tr>
+                    }
+                    else
+                    {
+                      for (int i = 0; i < topLoader.Count; i++)
+                      {
+                        var u = topLoader[i];
+                        <tr>
+                          <td class="num">@(i + 1)</td>
+                          <td class="unit-cell">@u.MachineName@if (u.Excluded) { <span class="bd-pill">BD</span> }</td>
+                          <td class="num">@FmtPct(u.RadioPct)</td>
+                          <td class="num">@FmtPct(u.DisplayPct)</td>
+                          <td class="num">@FmtPct(u.PlePct)</td>
+                          <td class="num">@FmtPct(u.GpsPct)</td>
+                          <td class="num"><strong class="tone-@PctTone(u.OverallPct)">@FmtPct(u.OverallPct)</strong></td>
+                        </tr>
+                      }
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="rank-card">
+              <div class="rank-header">
+                <h2>Top 10 Hauler Good Availability Overall</h2>
+                <span class="rank-badge ok">CT / KT</span>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="num">#</th>
+                      <th>Unit</th>
+                      <th class="num">Radio</th>
+                      <th class="num">Display</th>
+                      <th class="num">PLE</th>
+                      <th class="num">GPS</th>
+                      <th class="num">Overall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @if (topHauler.Count == 0)
+                    {
+                      <tr><td colspan="7" class="empty-row">Belum ada data availability Hauler.</td></tr>
+                    }
+                    else
+                    {
+                      for (int i = 0; i < topHauler.Count; i++)
+                      {
+                        var u = topHauler[i];
+                        <tr>
+                          <td class="num">@(i + 1)</td>
+                          <td class="unit-cell">@u.MachineName@if (u.Excluded) { <span class="bd-pill">BD</span> }</td>
+                          <td class="num">@FmtPct(u.RadioPct)</td>
+                          <td class="num">@FmtPct(u.DisplayPct)</td>
+                          <td class="num">@FmtPct(u.PlePct)</td>
+                          <td class="num">@FmtPct(u.GpsPct)</td>
+                          <td class="num"><strong class="tone-@PctTone(u.OverallPct)">@FmtPct(u.OverallPct)</strong></td>
+                        </tr>
+                      }
+                    }
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section aria-label="Rincian Availability Per Unit">
+          <div class="detail-toolbar">
+            <div class="section-title" style="margin-bottom:0;">
+              <span>Rincian Perangkat Semua Unit</span>
+            </div>
+            <div class="filter-row">
+              <label for="unitSearch" style="position:absolute;width:1px;height:1px;overflow:hidden;">Cari unit</label>
+              <input id="unitSearch" class="search-input" type="search" placeholder="Cari unit, misal CT7351" />
+              <button type="button" class="btn btn-active" data-prefix="ALL">Semua</button>
+              <button type="button" class="btn" data-prefix="CB">CB</button>
+              <button type="button" class="btn" data-prefix="HB">HB</button>
+              <button type="button" class="btn" data-prefix="KB">KB</button>
+              <button type="button" class="btn" data-prefix="CT">CT</button>
+              <button type="button" class="btn" data-prefix="KT">KT</button>
+            </div>
+          </div>
+
+          <div class="detail-box">
+            <table id="detailTable">
+              <thead>
+                <tr>
+                  <th class="num">No</th>
+                  <th class="num">OID</th>
+                  <th>Unit</th>
+                  <th>Tipe</th>
+                  <th>IP / Sumber</th>
+                  <th>Status</th>
+                  <th class="num">Loss</th>
+                  <th class="num">Uptime (j)</th>
+                  <th class="num">Downtime (j)</th>
+                  <th class="num">Coverage</th>
+                  <th class="num">Availability</th>
+                </tr>
+              </thead>
+              <tbody>
+                @if (unitList.Count == 0)
+                {
+                  <tr><td colspan="11" class="empty-row">Tidak ada data unit untuk periode ini.</td></tr>
+                }
+                else
+                {
+                  foreach (var u in unitList)
+                  {
+                    var pref = UnitPrefix(u.MachineName);
+                    foreach (var code in allCodes)
+                    {
+                      if (!u.Devices.TryGetValue(code, out var d)) continue;
+                      <tr data-unit="@u.MachineName.ToUpperInvariant()" data-prefix="@pref">
+                        <td class="num">@u.Rank</td>
+                        <td class="num">@u.MachineOid</td>
+                        <td class="unit-cell">@u.MachineName@if (u.Excluded) { <span class="bd-pill">BD</span> }</td>
+                        <td>@TypeName(code)</td>
+                        <td style="font-family:var(--font-mono);">@d.IpAddress</td>
+                        <td><span class="status-badge @d.Status">@d.Status</span></td>
+                        <td class="num">@(d.PacketLossPct.HasValue ? $"{d.PacketLossPct.Value:F1}%" : "N/A")</td>
+                        <td class="num">@($"{d.UptimeSeconds / 3600.0:F2}")</td>
+                        <td class="num">@($"{d.DowntimeSeconds / 3600.0:F2}")</td>
+                        <td class="num">@($"{d.CoveragePct:F2}%")</td>
+                        <td class="num"><strong>@FmtPct(d.AvailabilityPct)</strong></td>
+                      </tr>
+                    }
+                  }
+                }
+              </tbody>
+            </table>
+          </div>
+        </section>
+      }
+    </main>
+  </div>
+
+  <script>
+    const appSidebar = document.getElementById("appSidebar");
+    const sidebarToggle = document.getElementById("sidebarToggle");
+    const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+
+    function setSidebarExpanded(open) {
+      appSidebar.classList.toggle("expanded", open);
+      document.body.classList.toggle("sidebar-open", open);
+      sidebarToggle.setAttribute("aria-expanded", String(open));
+    }
+
+    sidebarToggle.addEventListener("click", () => setSidebarExpanded(!appSidebar.classList.contains("expanded")));
+    sidebarBackdrop.addEventListener("click", () => setSidebarExpanded(false));
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape" && appSidebar.classList.contains("expanded")) setSidebarExpanded(false);
+    });
+
+    const searchInput = document.getElementById("unitSearch");
+    const prefixBtns = Array.from(document.querySelectorAll("[data-prefix]"));
+    const detailRows = Array.from(document.querySelectorAll("#detailTable tbody tr[data-unit]"));
+    let activePrefix = "ALL";
+
+    function applyDetailFilter() {
+      const q = (searchInput?.value || "").trim().toUpperCase();
+      for (const row of detailRows) {
+        const unit = row.dataset.unit || "";
+        const pref = row.dataset.prefix || "";
+        const matchPrefix = activePrefix === "ALL" || pref === activePrefix;
+        const matchText = !q || unit.includes(q);
+        row.style.display = (matchPrefix && matchText) ? "" : "none";
+      }
+    }
+
+    if (searchInput) searchInput.addEventListener("input", applyDetailFilter);
+    for (const btn of prefixBtns) {
+      btn.addEventListener("click", () => {
+        activePrefix = btn.dataset.prefix || "ALL";
+        for (const b of prefixBtns) b.classList.toggle("btn-active", b === btn);
+        applyDetailFilter();
+      });
+    }
+
+    const REPORT_DATE_ISO = "@selectedDateStr";
+    const IS_CUSTOM_DATE = @(hasCustomDate ? "true" : "false");
+    const DONUT_CIRCUMFERENCE = 2 * Math.PI * 44;
+
+    function getToneFromPct(val) {
+      if (val === null || val === undefined || Number.isNaN(Number(val))) return "neutral";
+      const n = Number(val);
+      if (n >= 90) return "ok";
+      if (n >= 75) return "warn";
+      return "crit";
+    }
+
+    function getStateText(tone) {
+      if (tone === "ok") return "OPTIMAL";
+      if (tone === "warn") return "PERHATIAN";
+      if (tone === "crit") return "KRITIS";
+      return "N/A";
+    }
+
+    function updateKpiCard(key, availPct, covPct, targets) {
+      const card = document.querySelector(`.kpi-card[data-kpi-key="${key}"]`);
+      if (!card) return;
+      const hasVal = availPct !== null && availPct !== undefined && !Number.isNaN(Number(availPct));
+      const numVal = hasVal ? Number(availPct) : null;
+      const tone = getToneFromPct(numVal);
+
+      card.classList.remove("tone-card-ok", "tone-card-warn", "tone-card-crit", "tone-card-neutral");
+      card.classList.add(`tone-card-${tone}`);
+
+      const fill = card.querySelector(".donut-fill");
+      if (fill) {
+        fill.classList.remove("stroke-ok", "stroke-warn", "stroke-crit", "stroke-neutral");
+        fill.classList.add(`stroke-${tone}`);
+        const clamped = hasVal ? Math.max(0, Math.min(100, numVal)) : 0;
+        const offset = hasVal ? DONUT_CIRCUMFERENCE * (1 - clamped / 100) : DONUT_CIRCUMFERENCE;
+        fill.setAttribute("stroke-dashoffset", offset.toFixed(2));
+      }
+
+      const valEl = card.querySelector(".donut-val");
+      if (valEl) {
+        valEl.classList.remove("tone-ok", "tone-warn", "tone-crit", "tone-neutral");
+        valEl.classList.add(`tone-${tone}`);
+        valEl.textContent = hasVal ? `${numVal.toFixed(2)}%` : "N/A";
+      }
+
+      const stateEl = card.querySelector(".donut-state");
+      if (stateEl) stateEl.textContent = getStateText(tone);
+
+      const covEl = card.querySelector(".kpi-cov");
+      if (covEl && covPct !== null && covPct !== undefined && !Number.isNaN(Number(covPct))) {
+        covEl.textContent = `${Number(covPct).toFixed(1)}%`;
+      }
+
+      const tgtEl = card.querySelector(".kpi-targets");
+      if (tgtEl && targets !== null && targets !== undefined) {
+        tgtEl.textContent = String(targets);
+      }
+    }
+
+    function renderRdpTrendChart(payload) {
+      const svg = document.getElementById("rdpTrendSvg");
+      const metaEl = document.getElementById("trendMetaText");
+      const tooltipEl = document.getElementById("trendTooltip");
+      if (!svg || !payload || !Array.isArray(payload.hours)) return;
+
+      const hours = payload.hours;
+      const W = 1080, H = 235;
+      const padL = 46, padR = 18, padT = 16, padB = 30;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+
+      const xFor = i => padL + (i / 23) * plotW;
+      const yFor = pct => padT + ((100 - Math.max(0, Math.min(100, pct))) / 100) * plotH;
+
+      const ns = "http://www.w3.org/2000/svg";
+      svg.innerHTML = "";
+
+      // Grid horizontal Y: 100% (atas) ke 0% (bawah)
+      [100, 75, 50, 25, 0].forEach(level => {
+        const y = yFor(level);
+        const line = document.createElementNS(ns, "line");
+        line.setAttribute("x1", String(padL));
+        line.setAttribute("x2", String(W - padR));
+        line.setAttribute("y1", y.toFixed(1));
+        line.setAttribute("y2", y.toFixed(1));
+        line.setAttribute("class", level === 0 ? "trend-grid-line zero" : "trend-grid-line");
+        svg.appendChild(line);
+
+        const lbl = document.createElementNS(ns, "text");
+        lbl.setAttribute("x", String(padL - 8));
+        lbl.setAttribute("y", (y + 3.5).toFixed(1));
+        lbl.setAttribute("text-anchor", "end");
+        lbl.setAttribute("class", "trend-axis-label");
+        lbl.textContent = `${level}%`;
+        svg.appendChild(lbl);
+      });
+
+      // Grid vertikal & label X (Jam 00:00 s/d 23:00)
+      hours.forEach((h, idx) => {
+        const x = xFor(idx);
+        if (idx % 2 === 0 || idx === 23) {
+          const vLine = document.createElementNS(ns, "line");
+          vLine.setAttribute("x1", x.toFixed(1));
+          vLine.setAttribute("x2", x.toFixed(1));
+          vLine.setAttribute("y1", String(padT));
+          vLine.setAttribute("y2", String(padT + plotH));
+          vLine.setAttribute("class", "trend-grid-line");
+          svg.appendChild(vLine);
+
+          const xLbl = document.createElementNS(ns, "text");
+          xLbl.setAttribute("x", x.toFixed(1));
+          xLbl.setAttribute("y", String(H - 8));
+          xLbl.setAttribute("text-anchor", idx === 0 ? "start" : (idx === 23 ? "end" : "middle"));
+          xLbl.setAttribute("class", "trend-axis-label");
+          xLbl.textContent = h.label;
+          svg.appendChild(xLbl);
+        }
+      });
+
+      const seriesDefs = [
+        { key: "R", cls: "trend-line-r", color: "#38bdf8", legId: "legLatestR" },
+        { key: "D", cls: "trend-line-d", color: "#fbbf24", legId: "legLatestD" },
+        { key: "P", cls: "trend-line-p", color: "#c084fc", legId: "legLatestP" }
+      ];
+
+      seriesDefs.forEach(s => {
+        let pathD = "";
+        let latestVal = null;
+
+        hours.forEach((h, idx) => {
+          const raw = h[s.key];
+          if (raw === null || raw === undefined || Number.isNaN(Number(raw))) {
+            return;
+          }
+          const val = Number(raw);
+          latestVal = val;
+          const x = xFor(idx).toFixed(1);
+          const y = yFor(val).toFixed(1);
+          pathD += (pathD === "" ? `M ${x} ${y}` : ` L ${x} ${y}`);
+        });
+
+        if (pathD !== "") {
+          const path = document.createElementNS(ns, "path");
+          path.setAttribute("d", pathD);
+          path.setAttribute("class", `trend-line ${s.cls}`);
+          svg.appendChild(path);
+        }
+
+        hours.forEach((h, idx) => {
+          const raw = h[s.key];
+          if (raw === null || raw === undefined || Number.isNaN(Number(raw))) return;
+          const val = Number(raw);
+          const dot = document.createElementNS(ns, "circle");
+          dot.setAttribute("cx", xFor(idx).toFixed(1));
+          dot.setAttribute("cy", yFor(val).toFixed(1));
+          dot.setAttribute("r", "3.2");
+          dot.setAttribute("fill", s.color);
+          dot.setAttribute("stroke", "#121212");
+          dot.setAttribute("stroke-width", "1.2");
+          svg.appendChild(dot);
+        });
+
+        const legEl = document.getElementById(s.legId);
+        if (legEl) legEl.textContent = latestVal !== null ? `${latestVal.toFixed(2)}%` : "N/A";
+      });
+
+      // Hover hit-zones per jam untuk membaca angka persis R, D, P
+      const colW = plotW / 24;
+      hours.forEach((h, idx) => {
+        const hit = document.createElementNS(ns, "rect");
+        hit.setAttribute("x", (xFor(idx) - colW / 2).toFixed(1));
+        hit.setAttribute("y", String(padT));
+        hit.setAttribute("width", colW.toFixed(1));
+        hit.setAttribute("height", String(plotH));
+        hit.setAttribute("fill", "transparent");
+        hit.style.cursor = "crosshair";
+        hit.addEventListener("mouseenter", () => {
+          if (!tooltipEl) return;
+          const fmt = v => (v !== null && v !== undefined) ? `${Number(v).toFixed(2)}%` : "N/A";
+          tooltipEl.innerHTML =
+            `<strong>${h.label}</strong>` +
+            `<span style="color:#38bdf8;">R: ${fmt(h.R)}</span>` +
+            `<span style="color:#fbbf24;">D: ${fmt(h.D)}</span>` +
+            `<span style="color:#c084fc;">P: ${fmt(h.P)}</span>` +
+            `<span style="color:#a3a3a3;">(${h.samples ?? 0} ping)</span>`;
+          tooltipEl.classList.add("visible");
+        });
+        svg.appendChild(hit);
+      });
+
+      svg.addEventListener("mouseleave", () => {
+        if (tooltipEl) tooltipEl.classList.remove("visible");
+      });
+
+      if (metaEl) {
+        const upd = payload.last_update ? `Update ping terakhir ${payload.last_update}` : "Menunggu sampel ping";
+        metaEl.textContent = `Rentang 00:00 - 23:00 | Tanggal ${payload.date || REPORT_DATE_ISO} | ${upd}`;
+      }
+    }
+
+    async function refreshHourlyTrend() {
+      try {
+        const res = await fetch(`/api/availability/hourly?date=${encodeURIComponent(REPORT_DATE_ISO)}`, { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        renderRdpTrendChart(data);
+      } catch { }
+    }
+
+    refreshHourlyTrend();
+    setInterval(refreshHourlyTrend, 15000);
+
+    if (typeof signalR !== "undefined") {
+      const hubConn = new signalR.HubConnectionBuilder()
+        .withUrl("/telemetryHub")
+        .withAutomaticReconnect()
+        .build();
+
+      hubConn.on("availability_overall", data => {
+        if (!IS_CUSTOM_DATE && data && data.overall) {
+          const ov = data.overall;
+          updateKpiCard("Overall", ov.combined?.availability_pct, ov.combined?.coverage_pct, ov.combined?.target_count);
+          updateKpiCard("R", ov.R?.availability_pct, ov.R?.coverage_pct, ov.R?.target_count);
+          updateKpiCard("D", ov.D?.availability_pct, ov.D?.coverage_pct, ov.D?.target_count);
+          updateKpiCard("P", ov.P?.availability_pct, ov.P?.coverage_pct, ov.P?.target_count);
+          updateKpiCard("G", data.gps_overall?.availability_pct, data.gps_overall?.coverage_pct, data.gps_overall?.target_count);
+        }
+        refreshHourlyTrend();
+      });
+
+      hubConn.on("database_data", () => {
+        refreshHourlyTrend();
+      });
+
+      hubConn.start().catch(() => { });
+    }
+  </script>
+</body>
+</html>

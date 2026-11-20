@@ -86,4 +86,19 @@ app.MapGet("/export/availability_monthly.xlsx", async (AppConfig c, string? mont
     catch (Exception ex) { return Results.BadRequest(ex.Message); }
 });
 
+app.MapGet("/api/availability/hourly", (AppConfig c, string? date) =>
+{
+    var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, c.Timezone));
+    var reportDate = DateOnly.TryParseExact(date?.Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : today;
+    try
+    {
+        var payload = DatabaseService.GetHourlyRdpAvailability(c, reportDate);
+        return Results.Json(payload);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+
 app.Run();

@@ -67,8 +67,8 @@ public sealed class CollectorWorker(AppConfig cfg, ILogger<CollectorWorker> logg
         int maxGap = Math.Max(600, Math.Max(refreshMins * 180, cfg.MaxObservationGapSeconds));
 
         logger.LogInformation(
-            "[GPS-SAT] Worker satelit aktif (jeda 5 detik pasca-query; <= {Red} merah, {YMin}-{YMax} kuning, > {YMax} hijau).",
-            cfg.GpsRedBelow, cfg.GpsRedBelow + 1, cfg.GpsYellowMax);
+            "[GPS-SAT] Worker satelit aktif (jeda 5 detik pasca-query; <= {Red} merah, {YMin}-{YMax} kuning, > {YGreen} hijau).",
+            cfg.GpsRedBelow, cfg.GpsRedBelow + 1, cfg.GpsYellowMax, cfg.GpsYellowMax);
 
         while (!ct.IsCancellationRequested)
         {
@@ -123,7 +123,7 @@ public sealed class CollectorWorker(AppConfig cfg, ILogger<CollectorWorker> logg
 
         Task? satTask = null;
         if (satActive)
-            satTask = RunSatelliteLoopAsync(stoppingToken);
+            satTask = Task.Run(() => RunSatelliteLoopAsync(stoppingToken), stoppingToken);
         else
             logger.LogWarning("[GPS-SAT] Mode satelit tidak aktif (periksa query_gps.sql dan GPS_METRIC_COLUMN).");
 
