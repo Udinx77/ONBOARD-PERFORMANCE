@@ -48,7 +48,7 @@ public sealed class DashboardUpdaterService(
         store.Update([], initOverall ?? [], BuildCollectorStatus(cfg));
 
         var interval = TimeSpan.FromSeconds(Math.Max(5, cfg.SqlRefreshSeconds));
-        double satStaleLimit = Math.Max(1, cfg.GpsQueryRefreshMinutes) * 180.0;
+        double satStaleLimit = Math.Max(600.0, Math.Max(1, cfg.GpsQueryRefreshMinutes) * 180.0);
 
         while (!stoppingToken.IsCancellationRequested)
         {

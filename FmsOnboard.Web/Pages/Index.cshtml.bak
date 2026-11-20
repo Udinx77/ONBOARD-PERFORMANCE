@@ -1,0 +1,985 @@
+@page "/"
+@inject FmsOnboard.Core.AppConfig Cfg
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FMS Onboard Monitoring - Live Telemetry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <script src="/js/signalr.min.js"></script>
+  <style>
+    :root {
+      --bg-canvas: #000000;
+      --bg-topbar: #313131;
+      --bg-card: #3a3a3a;
+      --bg-card-hover: #3b3b3b;
+      --border-subtle: rgba(133, 133, 133, 0.658);
+      --border-hover: rgba(148, 163, 184, 0.26);
+
+      --text-primary: #ffffff;
+      --text-secondary: #ffffff;
+      --text-muted: #ffffff;
+
+      --accent: #3b3b3b;
+      --accent-ink: #ffffff;
+
+      --ok: #2dff37;
+      --ok-soft: rgba(68, 170, 0, 0.671);
+      --ok-border: rgba(52, 211, 20, 0.836);
+      --ok-text: #9aff86;
+
+      --warn: #fff126;
+      --warn-soft: rgba(161, 137, 0, 0.644);
+      --warn-border: rgba(209, 188, 0, 0.822);
+      --warn-text: #ffeb55;
+
+      --orange: #ff7a1a;
+      --orange-soft: rgba(170, 71, 0, 0.671);
+      --orange-border: rgba(249, 116, 22, 0.822);
+      --orange-text: #ffb765;
+
+      --crit: #fc2020;
+      --crit-soft: rgba(199, 0, 0, 0.774);
+      --crit-border: rgba(226, 0, 0, 0.925);
+      --crit-text: #ff5f5f;
+
+      --bd-tone: #38bdf8;
+      --bd-soft: rgba(56, 189, 248, 0.16);
+      --bd-border: rgba(56, 189, 248, 0.42);
+      --bd-text: #bae6fd;
+
+      --neutral-soft: rgba(148, 163, 184, 0.10);
+      --neutral-border: rgba(148, 163, 184, 0.24);
+      --neutral-text: #94a3b8;
+
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.4;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      width: 100%;
+      background: var(--bg-topbar);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 10px 18px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .brand-block { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+    .brand-title-row { display: flex; align-items: center; gap: 8px; }
+    .brand-title-row h1 {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--text-secondary);
+    }
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ok);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.55);
+      flex-shrink: 0;
+    }
+    .brand-dot.offline { background: var(--crit); box-shadow: 0 0 8px rgba(239, 68, 68, 0.55); }
+    .status-live-label { color: var(--ok-text); font-weight: 700; }
+    .status-live-label.offline { color: var(--crit-text); }
+    .sub-caption {
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .header-right {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    .nav-links { display: flex; align-items: center; gap: 6px; }
+    .btn {
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      padding: 6px 11px;
+      font-family: var(--font-sans);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      min-height: 32px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+    }
+    .btn:hover {
+      border-color: var(--border-hover);
+      color: var(--text-primary);
+      background: var(--bg-card-hover);
+    }
+
+    .kpi-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .kpi-main { display: flex; flex-direction: column; padding-right: 12px; border-right: 1px solid var(--border-subtle); }
+    .kpi-main-lbl { font-size: 10px; font-weight: 600; color: var(--text-secondary); }
+    .kpi-main-val {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 21px;
+      font-weight: 800;
+      line-height: 1.1;
+      color: var(--text-primary);
+    }
+    .kpi-subs { display: flex; align-items: center; gap: 12px; }
+    .kpi-mini { display: flex; flex-direction: column; }
+    .kpi-mini-lbl { font-size: 9.5px; color: var(--text-muted); font-weight: 600; }
+    .kpi-mini-val {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-top: 1px;
+    }
+    .kpi-mini-val.warn-txt { color: var(--crit-text); }
+    .kpi-mini-val.ok-txt { color: var(--ok-text); }
+    .kpi-updated { animation: flashBorder 0.7s ease; }
+
+    .container {
+      width: 100%;
+      max-width: 100%;
+      padding: 12px 18px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .alert-banner {
+      display: none;
+      background: var(--crit-soft);
+      border: 1px solid var(--crit-border);
+      color: var(--crit-text);
+      padding: 8px 14px;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .alert-banner.visible { display: block; }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      width: 100%;
+    }
+    .sum-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 9px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color 0.15s ease, background-color 0.15s ease, transform 0.15s ease;
+    }
+    .sum-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+      transform: translateY(-1px);
+    }
+    .sum-card.active-sum { border-color: rgba(234, 179, 8, 0.55); background: #161c28; }
+    .sum-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .sum-num {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .sum-num.need-check { color: var(--crit-text); }
+    .sum-num.monitoring { color: var(--warn-text); }
+    .sum-num.breakdown { color: var(--bd-text); }
+    .sum-num.normal { color: var(--ok-text); }
+
+    .sum-title { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+    .sum-title.need-check { color: var(--crit-text); }
+    .sum-title.monitoring { color: var(--warn-text); }
+    .sum-title.breakdown { color: var(--bd-text); }
+    .sum-title.normal { color: var(--ok-text); }
+
+    .sum-right {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .toolbar-left { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .search-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+      border-radius: 7px;
+      padding: 6px 11px;
+      font-family: var(--font-sans);
+      font-size: 12px;
+      width: 215px;
+      min-height: 32px;
+    }
+    .search-box::placeholder { color: var(--text-muted); }
+    .search-box:focus { outline: none; border-color: rgba(234, 179, 8, 0.6); }
+
+    .chip {
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-subtle);
+      border-radius: 7px;
+      padding: 5px 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      min-height: 32px;
+      transition: all 0.14s ease;
+    }
+    .chip:hover { border-color: var(--border-hover); color: var(--text-primary); background: var(--bg-card-hover); }
+    .chip.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      font-weight: 700;
+    }
+
+    .toolbar-count {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .groups-wrap { display: flex; flex-direction: column; gap: 18px; width: 100%; }
+    .unit-group { display: flex; flex-direction: column; gap: 8px; }
+    .unit-group.hidden { display: none; }
+    .group-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .group-title {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+    .group-title.need-check { color: var(--crit-text); }
+    .group-title.monitoring { color: var(--warn-text); }
+    .group-title.breakdown { color: var(--bd-text); }
+    .group-title.normal { color: var(--ok-text); }
+    .group-count {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .group-count.need-check { color: var(--crit-text); }
+    .group-count.monitoring { color: var(--warn-text); }
+    .group-count.breakdown { color: var(--bd-text); }
+    .group-count.normal { color: var(--ok-text); }
+
+    /* Unit Card Grid */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(182px, 1fr));
+      gap: 8px;
+      width: 100%;
+    }
+    .unit-card {
+      background:#2c2c2c ;
+      border: 1px solid var(--border-subtle);
+      border-radius: 9px;
+      padding: 8px 10px 9px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      transition: transform 0.14s ease, border-color 0.16s ease, background-color 0.16s ease;
+    }
+    .unit-card:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+      transform: translateY(-1px);
+    }
+    .unit-card.card-updated { animation: flashBorder 1.0s ease; }
+
+    @@keyframes flashBorder {
+      0% { border-color: rgb(212, 212, 212); }
+      100% { border-color: var(--border-subtle); }
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 5px;
+      min-height: 17px;
+    }
+    .unit-name {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+    }
+    .delay-pill {
+      font-family: var(--font-mono);
+      font-size: 8.5px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      max-width: 88px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      background: var(--crit-soft);
+      border: 1px solid var(--crit-border);
+      color: var(--crit-text);
+    }
+    .delay-pill.warn {
+      background: var(--warn-soft);
+      border-color: var(--warn-border);
+      color: var(--warn-text);
+    }
+    .delay-pill.bd {
+      background: var(--bd-soft);
+      border-color: var(--bd-border);
+      color: var(--bd-text);
+    }
+    .delay-pill.empty { display: none; }
+
+    /* Saturated Circular Parameter Indicators */
+    .lamps {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 3px;
+      justify-items: center;
+      align-items: center;
+    }
+    .lamp {
+      width: 25px;
+      height: 25px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--neutral-soft);
+      border: 1.5px solid var(--neutral-border);
+      color: var(--text-primary);
+      transition: transform 0.15s ease, background-color 0.2s ease, border-color 0.2s ease;
+    }
+    .lamp-k {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+    }
+
+    .lamp.ok { background: var(--ok-soft); border-color: var(--ok-border); }
+    .lamp.warn { background: var(--warn-soft); border-color: var(--warn-border); }
+    .lamp.orange { background: var(--orange-soft); border-color: var(--orange-border); }
+    .lamp.crit { background: var(--crit-soft); border-color: var(--crit-border); }
+    .lamp.neutral { background: var(--neutral-soft); border-color: var(--neutral-border); }
+    .lamp.pop { animation: pulsePop 0.8s ease; }
+    @@keyframes pulsePop { 0% { transform: scale(1); } 50% { transform: scale(1.14); } 100% { transform: scale(1); } }
+
+    .legend-footer {
+      margin-top: 6px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+    .legend-items { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .leg-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; border: 1.5px solid transparent; }
+
+    .drawer-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.72);
+      z-index: 50;
+      justify-content: flex-end;
+    }
+    .drawer-backdrop.open { display: flex; }
+    .drawer {
+      width: min(440px, 94vw);
+      background: var(--bg-topbar);
+      border-left: 1px solid var(--border-subtle);
+      height: 100%;
+      padding: 20px;
+      overflow-y: auto;
+    }
+    .drawer-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-subtle);
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+    }
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .detail-table th { color: var(--text-muted); font-size: 10.5px; text-transform: uppercase; }
+    .detail-table th, .detail-table td { padding: 9px 6px; border-bottom: 1px solid var(--border-subtle); text-align: left; }
+    .detail-table td.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+    a:focus-visible, button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    @@media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+    }
+
+    @@media (max-width: 1100px) {
+      .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @@media (max-width: 640px) {
+      .topbar { padding: 10px 12px; }
+      .container { padding: 10px 12px 24px; }
+      .summary-strip { grid-template-columns: 1fr; }
+      .kpi-box { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+      .search-box { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <div class="brand-title-row">
+        <h1>FMS Onboard Monitoring</h1>
+      </div>
+      <div class="status-line">
+        <span id="connDot" class="brand-dot offline" aria-hidden="true"></span>
+        <span id="connStateLabel" class="status-live-label offline">Menghubungkan</span>
+        <span id="connText">Menunggu server...</span>
+      </div>
+      <div id="subCaption" class="sub-caption">Menunggu ringkasan availability...</div>
+    </div>
+
+    <div class="header-right">
+      <div class="nav-links">
+        <a class="btn" href="/report/sqlite">Availability Dashboard</a>
+        <a class="btn" href="/export/availability.xlsx">Export XLSX</a>
+      </div>
+      <div class="kpi-box" aria-label="Ringkasan Availability">
+        <div class="kpi-main">
+          <span class="kpi-main-lbl">Overall</span>
+          <span id="kpiCombined" class="kpi-main-val">--</span>
+        </div>
+        <div class="kpi-subs">
+          <div class="kpi-mini"><span class="kpi-mini-lbl">Radio</span><span id="kpiR" class="kpi-mini-val">--</span></div>
+          <div class="kpi-mini"><span class="kpi-mini-lbl">Display</span><span id="kpiD" class="kpi-mini-val">--</span></div>
+          <div class="kpi-mini"><span class="kpi-mini-lbl">PLE</span><span id="kpiP" class="kpi-mini-val">--</span></div>
+          <div class="kpi-mini"><span class="kpi-mini-lbl">GPS</span><span id="kpiG" class="kpi-mini-val">--</span></div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="collectorBanner" class="alert-banner" role="alert"></div>
+
+    <section class="summary-strip" aria-label="Ringkasan Kategori Unit">
+      <button type="button" class="sum-card" data-status-filter="NEED_CHECK">
+        <div class="sum-left">
+          <span id="sumNumNEED_CHECK" class="sum-num need-check">0</span>
+          <div class="sum-title-wrap">
+            <span class="sum-title need-check">Need Check</span>
+            <span class="sum-bar need-check"></span>
+          </div>
+        </div>
+        <div class="sum-right">
+          <span id="sumRoleNEED_CHECK">Loader 0, HD 0</span>
+          <span id="sumSubNEED_CHECK">0 unit</span>
+        </div>
+      </button>
+
+      <button type="button" class="sum-card" data-status-filter="MONITORING">
+        <div class="sum-left">
+          <span id="sumNumMONITORING" class="sum-num monitoring">0</span>
+          <div class="sum-title-wrap">
+            <span class="sum-title monitoring">Monitoring</span>
+            <span class="sum-bar monitoring"></span>
+          </div>
+        </div>
+        <div class="sum-right">
+          <span id="sumRoleMONITORING">Loader 0, HD 0</span>
+          <span id="sumSubMONITORING">0 unit</span>
+        </div>
+      </button>
+
+      <button type="button" class="sum-card" data-status-filter="BREAKDOWN">
+        <div class="sum-left">
+          <span id="sumNumBREAKDOWN" class="sum-num breakdown">0</span>
+          <div class="sum-title-wrap">
+            <span class="sum-title breakdown">Breakdown</span>
+            <span class="sum-bar breakdown"></span>
+          </div>
+        </div>
+        <div class="sum-right">
+          <span id="sumRoleBREAKDOWN">Loader 0, HD 0</span>
+          <span id="sumSubBREAKDOWN">0 unit</span>
+        </div>
+      </button>
+
+      <button type="button" class="sum-card" data-status-filter="NORMAL">
+        <div class="sum-left">
+          <span id="sumNumNORMAL" class="sum-num normal">0</span>
+          <div class="sum-title-wrap">
+            <span class="sum-title normal">Normal</span>
+            <span class="sum-bar normal"></span>
+          </div>
+        </div>
+        <div class="sum-right">
+          <span id="sumRoleNORMAL">Loader 0, HD 0</span>
+          <span id="sumSubNORMAL">0 unit</span>
+        </div>
+      </button>
+    </section>
+
+    <section class="toolbar">
+      <div class="toolbar-left">
+        <input id="searchInput" class="search-box" type="search" placeholder="Cari unit, misal CT7351" aria-label="Cari unit atau OID" />
+        <button type="button" class="chip active" data-chip="ALL">Semua</button>
+        <button type="button" class="chip" data-chip="CB">CB</button>
+        <button type="button" class="chip" data-chip="HB">HB</button>
+        <button type="button" class="chip" data-chip="KB">KB</button>
+        <button type="button" class="chip" data-chip="CT">CT</button>
+        <button type="button" class="chip" data-chip="KT">KT</button>
+        <button type="button" class="chip" data-chip="GPS_NORMAL">GPS normal</button>
+        <button type="button" class="chip" data-chip="GPS_ERROR">GPS error</button>
+      </div>
+      <div id="visibleCounter" class="toolbar-count">Menampilkan 0 dari 0 unit</div>
+    </section>
+
+    <div id="groupedUnits" class="groups-wrap" aria-live="polite">
+      <section class="unit-group" data-group="NEED_CHECK">
+        <div class="group-header"><h2 class="group-title need-check">Need Check</h2><span id="grpCntNEED_CHECK" class="group-count need-check">0</span></div>
+        <div id="gridNEED_CHECK" class="grid"></div>
+      </section>
+      <section class="unit-group" data-group="MONITORING">
+        <div class="group-header"><h2 class="group-title monitoring">Monitoring</h2><span id="grpCntMONITORING" class="group-count monitoring">0</span></div>
+        <div id="gridMONITORING" class="grid"></div>
+      </section>
+      <section class="unit-group" data-group="BREAKDOWN">
+        <div class="group-header"><h2 class="group-title breakdown">Breakdown</h2><span id="grpCntBREAKDOWN" class="group-count breakdown">0</span></div>
+        <div id="gridBREAKDOWN" class="grid"></div>
+      </section>
+      <section class="unit-group" data-group="NORMAL">
+        <div class="group-header"><h2 class="group-title normal">Normal</h2><span id="grpCntNORMAL" class="group-count normal">0</span></div>
+        <div id="gridNORMAL" class="grid"></div>
+      </section>
+    </div>
+
+    <footer class="legend-footer">
+      <div class="legend-items">
+        <span class="legend-item"><span class="leg-dot" style="background:var(--ok-soft);border-color:var(--ok-border);"></span>Normal</span>
+        <span class="legend-item"><span class="leg-dot" style="background:var(--warn-soft);border-color:var(--warn-border);"></span>Gangguan ringan</span>
+        <span class="legend-item"><span class="leg-dot" style="background:var(--orange-soft);border-color:var(--orange-border);"></span>Gangguan sedang</span>
+        <span class="legend-item"><span class="leg-dot" style="background:var(--crit-soft);border-color:var(--crit-border);"></span>Gangguan berat / offline</span>
+        <span class="legend-item"><span class="leg-dot" style="background:var(--neutral-soft);border-color:var(--neutral-border);"></span>Tidak ada IP / N/A</span>
+      </div>
+      <div>OP: Operasional, HS: Health/Delay, R: Radio, D: Display, P: PLE, G: GPS Satelit (merah &le; @Cfg.GpsRedBelow, kuning &le; @Cfg.GpsYellowMax). Klik card unit untuk melihat detail availability perangkat onboard.</div>
+    </footer>
+  </main>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" role="dialog" aria-modal="true">
+    <div class="drawer">
+      <div class="drawer-head">
+        <div><h2 id="drawerTitle" style="font-size:16px;font-family:var(--font-mono);color:var(--text-primary);">Detail Unit</h2><small id="drawerSub" style="color:var(--text-secondary);"></small></div>
+        <button type="button" id="drawerClose" class="btn">Tutup</button>
+      </div>
+      <div id="drawerBody"></div>
+    </div>
+  </div>
+
+  <script>
+    const GPS_RED_BELOW = Number(@Cfg.GpsRedBelow);
+    const GPS_YELLOW_MAX = Number(@Cfg.GpsYellowMax);
+    const GROUP_ORDER = ["NEED_CHECK", "MONITORING", "BREAKDOWN", "NORMAL"];
+
+    let allUnits = [], activeChip = "ALL", activeStatusFilter = null, searchQuery = "", lastSig = "", selectedOid = null;
+    let lastUpdatedTime = "--:--:--";
+    const cardSnap = new Map();
+    const cardElements = new Map();
+
+    function getUnitPrefix(name) {
+      return String(name || "").trim().toUpperCase().slice(0, 2);
+    }
+    function getUnitRole(name) {
+      const p = getUnitPrefix(name);
+      if (p === "CB" || p === "HB" || p === "KB") return "LOADER";
+      if (p === "CT" || p === "KT") return "HAULER";
+      return null;
+    }
+    function hasOnboardIp(u) {
+      const p = u && u.ping;
+      if (!p) return false;
+      return Boolean((p.R && p.R.ip) || (p.D && p.D.ip) || (p.P && p.P.ip));
+    }
+    function fmtPct(v) { return (v === null || v === undefined || Number.isNaN(Number(v))) ? "N/A" : Number(v).toFixed(2) + "%"; }
+    function pulseElement(el, cls) {
+      if (!el) return;
+      el.classList.remove(cls);
+      void el.offsetWidth;
+      el.classList.add(cls);
+    }
+    function satTone(sats, backendState) {
+      if (backendState === "crit" || backendState === "warn" || backendState === "ok") return backendState;
+      if (sats === null || sats === undefined) return "crit";
+      const n = Number(sats);
+      if (n <= GPS_RED_BELOW) return "crit";
+      if (n <= GPS_YELLOW_MAX) return "warn";
+      return "ok";
+    }
+    function pingTone(dev) {
+      if (!dev || !dev.status) return "neutral";
+      return dev.status === "Green" ? "ok" : dev.status === "Yellow" ? "warn" : dev.status === "Orange" ? "orange" : dev.status === "Red" ? "crit" : "neutral";
+    }
+    function classifyUnit(u) {
+      if (u.is_bd) return "BREAKDOWN";
+      const p = u.ping || {};
+      const tones = ["R", "D", "P"].map(k => pingTone(p[k]));
+      if (tones.includes("crit")) return "NEED_CHECK";
+      if (tones.includes("orange") || tones.includes("warn")) return "MONITORING";
+      return "NORMAL";
+    }
+    function buildUnitView(u) {
+      const cat = classifyUnit(u), p = u.ping || {};
+      const prefix = getUnitPrefix(u.Name);
+      const role = getUnitRole(u.Name);
+      const hasDelay = Boolean(u.DelayClassName || u.DelayCategory || u.DelayClassOid);
+      const isEngineOn = !u.is_bd && (hasDelay || u.MachineStatus === 2 || u.MachineStatus === 0);
+      const opTone = u.is_bd ? "crit" : (isEngineOn ? "ok" : "crit");
+      const opText = u.is_bd ? "BD" : (hasDelay ? "DLY (Mesin Nyala)" : (isEngineOn ? "RUN" : "OFF"));
+      const hsTone = u.is_bd ? "neutral" : (hasDelay ? "warn" : "ok");
+      const gTone = satTone(u.GPS_SATELLITES, u.GPS_STATE);
+      const lamps = [
+        { k: "OP", tone: opTone, tip: `OP: ${opText} (MachineStatus: ${u.MachineStatus})` },
+        { k: "HS", tone: hsTone, tip: `HS: ${u.DelayClassName || "Normal"}` },
+        { k: "R", tone: pingTone(p.R), tip: p.R ? `Radio (${p.R.ip}) - klik card untuk detail availability` : "Radio: No IP" },
+        { k: "D", tone: pingTone(p.D), tip: p.D ? `Display (${p.D.ip}) - klik card untuk detail availability` : "Display: No IP" },
+        { k: "P", tone: pingTone(p.P), tip: p.P ? `PLE (${p.P.ip}) - klik card untuk detail availability` : "PLE: No IP" },
+        { k: "G", tone: gTone, tip: `GPS Satelit: ${u.GPS_SATELLITES ?? "NULL"}` }
+      ];
+      const pillText = u.is_bd ? (u.DelayClassName || "BD") : (u.DelayClassName || "");
+      const pillTone = u.is_bd ? "bd" : (cat === "NEED_CHECK" ? "crit" : "warn");
+      return { oid: u.OID, name: u.Name || `OID-${u.OID}`, prefix, role, cat, pillText, pillTone, lamps, gTone };
+    }
+    function patchCard(el, view) {
+      const prev = cardSnap.get(view.oid);
+      const sig = JSON.stringify({ c: view.cat, p: view.pillText, l: view.lamps });
+      if (prev && prev.sig === sig) return;
+      el.querySelector(".unit-name").textContent = view.name;
+      const pill = el.querySelector(".delay-pill");
+      if (view.pillText) {
+        pill.textContent = view.pillText;
+        pill.title = view.pillText;
+        pill.className = `delay-pill ${view.pillTone}`;
+      } else {
+        pill.textContent = "";
+        pill.className = "delay-pill empty";
+      }
+      const lampEls = el.querySelectorAll(".lamp");
+      view.lamps.forEach((lp, idx) => {
+        const le = lampEls[idx], prevLp = prev ? prev.lamps[idx] : null;
+        if (!prevLp || prevLp.tone !== lp.tone || prevLp.tip !== lp.tip) {
+          le.className = `lamp ${lp.tone}` + (prevLp && prevLp.tone !== lp.tone ? " pop" : "");
+          le.title = lp.tip;
+        }
+      });
+      if (prev) pulseElement(el, "card-updated");
+      cardSnap.set(view.oid, { sig, lamps: view.lamps });
+    }
+    function createCardElement(view) {
+      const el = document.createElement("article");
+      el.className = "unit-card";
+      el.tabIndex = 0; el.setAttribute("role", "button"); el.dataset.oid = String(view.oid);
+      el.innerHTML = `<div class="card-head"><span class="unit-name"></span><span class="delay-pill empty"></span></div><div class="lamps">${["OP","HS","R","D","P","G"].map(k => `<div class="lamp"><span class="lamp-k">${k}</span></div>`).join("")}</div>`;
+      el.addEventListener("click", () => openDrawer(view.oid));
+      el.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(view.oid); } });
+      patchCard(el, view);
+      return el;
+    }
+    function formatPrefixBreakdown(items) {
+      const counts = {};
+      for (const it of items) counts[it.prefix] = (counts[it.prefix] || 0) + 1;
+      const parts = ["CB", "HB", "KB", "CT", "KT"].filter(k => counts[k] > 0).map(k => `${counts[k]} ${k}`);
+      return parts.length > 0 ? parts.join(", ") : "0 unit";
+    }
+    function renderGrid() {
+      const validUnits = allUnits.filter(u => getUnitRole(u.Name) !== null && hasOnboardIp(u));
+      const views = validUnits.map(buildUnitView);
+
+      const groupViews = { NEED_CHECK: [], MONITORING: [], BREAKDOWN: [], NORMAL: [] };
+      for (const v of views) if (groupViews[v.cat]) groupViews[v.cat].push(v);
+
+      for (const grp of GROUP_ORDER) {
+        const list = groupViews[grp];
+        const loaders = list.filter(x => x.role === "LOADER").length;
+        const haulers = list.filter(x => x.role === "HAULER").length;
+        const numEl = document.getElementById(`sumNum${grp}`);
+        const roleEl = document.getElementById(`sumRole${grp}`);
+        const subEl = document.getElementById(`sumSub${grp}`);
+        if (numEl) numEl.textContent = String(list.length);
+        if (roleEl) roleEl.textContent = `Loader ${loaders}, HD ${haulers}`;
+        if (subEl) subEl.textContent = formatPrefixBreakdown(list);
+      }
+
+      document.getElementById("connText").textContent =
+        `${lastUpdatedTime} | Total ${views.length} unit: Need Check ${groupViews.NEED_CHECK.length}, Monitoring ${groupViews.MONITORING.length}, Breakdown ${groupViews.BREAKDOWN.length}, Normal ${groupViews.NORMAL.length}`;
+
+      const q = searchQuery.trim().toLowerCase();
+      const filtered = views.filter(v => {
+        if (activeStatusFilter && v.cat !== activeStatusFilter) return false;
+        if (activeChip === "GPS_ERROR" && v.gTone === "ok") return false;
+        if (activeChip === "GPS_NORMAL" && v.gTone !== "ok") return false;
+        if (["CB", "HB", "KB", "CT", "KT"].includes(activeChip) && v.prefix !== activeChip) return false;
+        if (q && !v.name.toLowerCase().includes(q) && !String(v.oid).includes(q)) return false;
+        return true;
+      });
+
+      document.getElementById("visibleCounter").textContent = `Menampilkan ${filtered.length} dari ${views.length} unit`;
+
+      const buckets = { NEED_CHECK: [], MONITORING: [], BREAKDOWN: [], NORMAL: [] };
+      const activeOids = new Set();
+      for (const v of filtered) {
+        activeOids.add(v.oid);
+        if (buckets[v.cat]) buckets[v.cat].push(v);
+      }
+
+      for (const [oid, el] of cardElements.entries()) {
+        if (!activeOids.has(oid)) {
+          el.remove();
+          cardElements.delete(oid);
+          cardSnap.delete(oid);
+        }
+      }
+
+      for (const grp of GROUP_ORDER) {
+        const list = buckets[grp] || [];
+        const section = document.querySelector(`.unit-group[data-group="${grp}"]`);
+        const grid = document.getElementById(`grid${grp}`);
+        const badge = document.getElementById(`grpCnt${grp}`);
+        if (badge) badge.textContent = String(list.length);
+        if (section) section.classList.toggle("hidden", list.length === 0);
+
+        list.forEach((v, idx) => {
+          let card = cardElements.get(v.oid);
+          if (!card) {
+            card = createCardElement(v);
+            cardElements.set(v.oid, card);
+          } else {
+            patchCard(card, v);
+          }
+          if (grid.children[idx] !== card) {
+            grid.insertBefore(card, grid.children[idx] || null);
+          }
+        });
+      }
+
+      if (selectedOid !== null) renderDrawerContent(selectedOid);
+    }
+    function renderDrawerContent(oid) {
+      const u = allUnits.find(x => x.OID === oid); if (!u) return;
+      const role = getUnitRole(u.Name);
+      document.getElementById("drawerTitle").textContent = `${u.Name} (OID ${u.OID})`;
+      document.getElementById("drawerSub").textContent = `${role ? role + " | " : ""}${u.is_bd ? "Status: BREAKDOWN" : (u.DelayClassName || "Status: Normal")}`;
+      const p = u.ping || {};
+      const rows = ["R", "D", "P"].map(k => {
+        const d = p[k];
+        return `<tr><td><strong>${k}</strong></td><td class="num">${d ? d.ip : "-"}</td><td class="num">${d ? d.status : "N/A"}</td><td class="num">${d ? fmtPct(d.availability_pct) : "N/A"}</td><td class="num">${d ? d.loss_pct.toFixed(1) + "%" : "-"}</td></tr>`;
+      }).join("");
+      document.getElementById("drawerBody").innerHTML = `<table class="detail-table"><thead><tr><th>Tipe</th><th>IP</th><th>Status</th><th>Avail.</th><th>Loss</th></tr></thead><tbody>${rows}<tr><td><strong>G (Sat)</strong></td><td class="num">Minestar</td><td class="num">${u.GPS_SATELLITES ?? "NULL"} sat</td><td class="num">${fmtPct(u.gps_availability_pct)}</td><td class="num">-</td></tr></tbody></table>`;
+    }
+    function openDrawer(oid) { selectedOid = oid; renderDrawerContent(oid); document.getElementById("drawerBackdrop").classList.add("open"); }
+    document.getElementById("drawerClose").addEventListener("click", () => { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); });
+    document.getElementById("drawerBackdrop").addEventListener("click", e => { if (e.target.id === "drawerBackdrop") { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); } });
+    document.addEventListener("keydown", e => { if (e.key === "Escape" && selectedOid !== null) { selectedOid = null; document.getElementById("drawerBackdrop").classList.remove("open"); } });
+
+    document.querySelectorAll(".sum-card").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const st = btn.dataset.statusFilter;
+        activeStatusFilter = (activeStatusFilter === st) ? null : st;
+        document.querySelectorAll(".sum-card").forEach(c => c.classList.toggle("active-sum", c.dataset.statusFilter === activeStatusFilter));
+        renderGrid();
+      });
+    });
+
+    document.querySelectorAll(".chip").forEach(btn => btn.addEventListener("click", () => {
+      document.querySelectorAll(".chip").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      activeChip = btn.dataset.chip;
+      if (activeChip === "ALL") {
+        activeStatusFilter = null;
+        document.querySelectorAll(".sum-card").forEach(c => c.classList.remove("active-sum"));
+      }
+      renderGrid();
+    }));
+
+    document.getElementById("searchInput").addEventListener("input", e => { searchQuery = e.target.value; renderGrid(); });
+
+    if (typeof signalR !== "undefined") {
+      const conn = new signalR.HubConnectionBuilder()
+        .withUrl("/telemetryHub")
+        .withAutomaticReconnect()
+        .build();
+
+      conn.onreconnecting(() => {
+        document.getElementById("connDot").classList.add("offline");
+        const lbl = document.getElementById("connStateLabel");
+        lbl.classList.add("offline");
+        lbl.textContent = "Terputus";
+      });
+      conn.onreconnected(() => {
+        document.getElementById("connDot").classList.remove("offline");
+        const lbl = document.getElementById("connStateLabel");
+        lbl.classList.remove("offline");
+        lbl.textContent = "Operasional";
+      });
+
+      function setMiniKpi(id, pct) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const txt = fmtPct(pct);
+        if (el.textContent !== txt) {
+          el.textContent = txt;
+          pulseElement(el, "kpi-updated");
+        }
+        el.classList.remove("warn-txt", "ok-txt");
+        if (pct !== null && pct !== undefined && !Number.isNaN(Number(pct))) {
+          el.classList.add(Number(pct) >= 95 ? "ok-txt" : "warn-txt");
+        }
+      }
+
+      conn.on("availability_overall", data => {
+        if (!data || !data.overall) return;
+        const ov = data.overall;
+        const mainEl = document.getElementById("kpiCombined");
+        const mainTxt = fmtPct(ov.combined?.availability_pct);
+        if (mainEl && mainEl.textContent !== mainTxt) {
+          mainEl.textContent = mainTxt;
+          pulseElement(mainEl.closest(".kpi-box"), "kpi-updated");
+        }
+        setMiniKpi("kpiR", ov.R?.availability_pct);
+        setMiniKpi("kpiD", ov.D?.availability_pct);
+        setMiniKpi("kpiP", ov.P?.availability_pct);
+        setMiniKpi("kpiG", data.gps_overall?.availability_pct);
+
+        document.getElementById("subCaption").textContent =
+          `Coverage ${fmtPct(ov.combined?.coverage_pct)} | Target ${ov.combined?.target_count ?? 0} unit | ${data.excluded_count ?? 0} unit Breakdown/Antri tidak dihitung | Auto-refresh @Cfg.SqlRefreshSeconds d`;
+      });
+
+      conn.on("collector_status", st => {
+        const banner = document.getElementById("collectorBanner");
+        if (!st) return;
+        if (st.failed || st.stale) {
+          banner.classList.add("visible");
+          banner.textContent = st.failed
+            ? `PERINGATAN COLLECTOR: ${st.error_message || "Scan terakhir gagal."}`
+            : "PERINGATAN COLLECTOR: Data ping SQLite belum diperbarui (collector tidak aktif / terlambat).";
+        } else {
+          banner.classList.remove("visible");
+        }
+      });
+
+      conn.on("database_data", rows => {
+        if (!Array.isArray(rows)) return;
+        lastUpdatedTime = new Date().toLocaleTimeString("id-ID", { hour12: false });
+        const sig = JSON.stringify(rows);
+        if (sig === lastSig) {
+          renderGrid();
+          return;
+        }
+        lastSig = sig;
+        allUnits = rows;
+        renderGrid();
+      });
+
+      conn.start().then(() => {
+        document.getElementById("connDot").classList.remove("offline");
+        const lbl = document.getElementById("connStateLabel");
+        lbl.classList.remove("offline");
+        lbl.textContent = "Operasional";
+      }).catch(err => {
+        document.getElementById("connText").textContent = "Gagal terhubung: " + err;
+      });
+    } else {
+      document.getElementById("connText").textContent = "Error: /js/signalr.min.js tidak ditemukan.";
+    }
+  </script>
+</body>
+</html>

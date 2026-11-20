@@ -6,6 +6,53 @@ namespace FmsOnboard.Core;
 
 public static class DatabaseService
 {
+    private static volatile HashSet<long> _excludedAvailabilityOids = [];
+    private static long _lastExcludedRefreshSec;
+
+    private static void EnsureExcludedOidsFresh(AppConfig cfg)
+    {
+        long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long prev = Interlocked.Read(ref _lastExcludedRefreshSec);
+        if (nowSec - prev < 30 || Interlocked.CompareExchange(ref _lastExcludedRefreshSec, nowSec, prev) != prev)
+            return;
+
+        try
+        {
+            const string sql = """
+                SELECT
+                    m.MACHINE_OID,
+                    CAST(m.IS_ACTIVE AS INT) AS IsActive,
+                    J1.NAME AS DelayName,
+                    J1.DELAYCATEGORY,
+                    J1.DELAYCLASS_OID
+                FROM [msmodel_rep].[dbo].[MACHINE] m
+                LEFT JOIN [mshist_rep].[dbo].[DELAY] P
+                    ON P.TARGET_MACHINE = m.MACHINE_OID AND P.STATUS = 3
+                LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] J1
+                    ON P.DELAYCLASS = J1.DELAYCLASS_OID
+                WHERE LEFT(UPPER(LTRIM(RTRIM(m.NAME))), 2) IN ('CB', 'HB', 'KB', 'CT', 'KT')
+                """;
+            using var odbcConn = new OdbcConnection(cfg.SqlConnectionString);
+            odbcConn.Open();
+            using var cmd = new OdbcCommand(sql, odbcConn);
+            using var rdr = cmd.ExecuteReader();
+            var excluded = new HashSet<long>();
+            while (rdr.Read())
+            {
+                if (rdr.IsDBNull(0) || !long.TryParse(rdr.GetValue(0)?.ToString()?.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out long oid))
+                    continue;
+                bool isActive = !rdr.IsDBNull(1) && rdr.GetValue(1)?.ToString()?.Trim() == "1";
+                string dName = rdr.IsDBNull(2) ? "" : (rdr.GetValue(2)?.ToString()?.Trim() ?? "");
+                long? dCat = !rdr.IsDBNull(3) && long.TryParse(rdr.GetValue(3)?.ToString()?.Trim(), out long dc) ? dc : null;
+                long? dCls = !rdr.IsDBNull(4) && long.TryParse(rdr.GetValue(4)?.ToString()?.Trim(), out long dco) ? dco : null;
+                bool isBd = dCat is 165096025 or 165096022 || dCls is 165097066 or 165097069;
+                bool hasDelay = !string.IsNullOrWhiteSpace(dName) || dCat.HasValue || dCls.HasValue;
+                if (!isActive || isBd || hasDelay) excluded.Add(oid);
+            }
+            _excludedAvailabilityOids = excluded;
+        }
+        catch { }
+    }
     public static SqliteConnection ConnectDb(string dbPath)
     {
         var conn = new SqliteConnection($"Data Source={dbPath};Default Timeout=30;");
@@ -251,6 +298,7 @@ public static class DatabaseService
         Dictionary<string, PingStat> results,
         string[] skipAvailabilityTypes)
     {
+        EnsureExcludedOidsFresh(cfg);
         using var conn = ConnectDb(cfg.DbFile);
         using var tx = conn.BeginTransaction();
 
@@ -337,7 +385,8 @@ public static class DatabaseService
             {
                 double gap = finishedAt - prevLastChk;
                 gapSeconds = gap;
-                if (gap > 0.0 && gap <= cfg.MaxObservationGapSeconds && !skipAvailabilityTypes.Contains(target.DeviceType))
+                bool isExcludedUnit = _excludedAvailabilityOids.Contains(target.MachineOid);
+                if (!isExcludedUnit && gap > 0.0 && gap <= cfg.MaxObservationGapSeconds && !skipAvailabilityTypes.Contains(target.DeviceType))
                 {
                     SplitIntervalByLocalDay(
                         conn, tx, prevLastChk, finishedAt,
@@ -514,6 +563,7 @@ public static class DatabaseService
 
     public static int SaveGpsSamples(AppConfig cfg, List<(long Oid, string Name, bool Normal)> samples, int maxGapSeconds)
     {
+        EnsureExcludedOidsFresh(cfg);
         double nowTs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
         int counted = 0;
 
@@ -541,7 +591,7 @@ public static class DatabaseService
             if (lastTs.HasValue)
             {
                 double gap = nowTs - lastTs.Value;
-                if (gap > 0.0 && gap <= maxGapSeconds)
+                if (!_excludedAvailabilityOids.Contains(oid) && gap > 0.0 && gap <= maxGapSeconds)
                 {
                     SplitIntervalByLocalDay(
                         conn, tx, lastTs.Value, nowTs,
@@ -849,7 +899,7 @@ public static class DatabaseService
                 double? sats = rdr.IsDBNull(1) ? null : rdr.GetDouble(1);
                 string state = rdr.GetString(2);
                 double fetchedAt = rdr.GetDouble(3);
-                if ((nowTs - fetchedAt) <= staleLimitSecs)
+                if ((nowTs - fetchedAt) <= Math.Max(staleLimitSecs, 600.0))
                     gpsMap[oid] = (sats, state);
             }
         }
@@ -871,6 +921,7 @@ public static class DatabaseService
             SELECT
                 m.MACHINE_OID AS OID,
                 m.NAME AS MachineName,
+                CAST(m.IS_ACTIVE AS INT) AS MachineStatus,
                 d.DELAYCATEGORY AS DelayCategory,
                 d.DELAYCLASS_OID AS DelayClassOid,
                 d.DELAY_NAME AS DelayClassName
@@ -903,6 +954,7 @@ public static class DatabaseService
 
         var rowsOut = new List<Dictionary<string, object?>>();
         var bdOids = new List<long>();
+        var excludedOids = new HashSet<long>();
 
         while (odbcReader.Read())
         {
@@ -935,6 +987,7 @@ public static class DatabaseService
             if (isIdwp)
             {
                 bdOids.Add(oid);
+                excludedOids.Add(oid);
                 continue;
             }
 
@@ -960,6 +1013,8 @@ public static class DatabaseService
 
             bool isAntri = delayName.Contains("Antri", StringComparison.OrdinalIgnoreCase);
             bool isBd = delayCat is 165096025 or 165096022 || delayCls is 165097066 or 165097069;
+            bool hasDelay = !string.IsNullOrWhiteSpace(delayName) || delayCat.HasValue || delayCls.HasValue;
+            if (mStatus != 1 || isBd || hasDelay) excludedOids.Add(oid);
             if (isBd || isAntri) bdOids.Add(oid);
 
             double? satellites = null;
@@ -986,6 +1041,9 @@ public static class DatabaseService
                 ["gps_availability_pct"] = gpsAv?.AvailabilityPct
             });
         }
+
+        _excludedAvailabilityOids = excludedOids;
+        Interlocked.Exchange(ref _lastExcludedRefreshSec, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
         if (bdOids.Count > 0)
         {
