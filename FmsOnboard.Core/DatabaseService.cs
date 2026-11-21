@@ -9,11 +9,50 @@ public static class DatabaseService
     private static volatile HashSet<long> _excludedAvailabilityOids = [];
     private static long _lastExcludedRefreshSec;
 
-    private static void EnsureExcludedOidsFresh(AppConfig cfg)
+    private static readonly string[] ExcludedDelayKeywords =
+    [
+        "antri",
+        "refueling",
+        "refuel",
+        "no alloc",
+        "wait moving",
+        "toilet",
+        "front",
+        "moving keluar jalur refuel",
+        "wait truck",
+        "cust problem",
+        "berdoa",
+        "meal",
+        "idwp",
+        "breakdown"
+    ];
+
+    public static bool HasExcludedDelayTrigger(string? delayName)
+    {
+        if (string.IsNullOrWhiteSpace(delayName)) return false;
+        foreach (var kw in ExcludedDelayKeywords)
+        {
+            if (delayName.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    public static bool IsUnitNormalForAvailability(bool isActive, long? delayCat, long? delayCls, string? delayName)
+    {
+        if (!isActive) return false;
+        bool isBd = delayCat is 165096025 or 165096022 || delayCls is 165097066 or 165097069;
+        if (isBd) return false;
+        if (HasExcludedDelayTrigger(delayName)) return false;
+        bool hasAnyActiveDelay = !string.IsNullOrWhiteSpace(delayName) || delayCat.HasValue || delayCls.HasValue;
+        return !hasAnyActiveDelay;
+    }
+
+    private static void EnsureExcludedOidsFresh(AppConfig cfg, bool forceRefresh = false)
     {
         long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         long prev = Interlocked.Read(ref _lastExcludedRefreshSec);
-        if (nowSec - prev < 30 || Interlocked.CompareExchange(ref _lastExcludedRefreshSec, nowSec, prev) != prev)
+        if (!forceRefresh && (nowSec - prev < 15 || Interlocked.CompareExchange(ref _lastExcludedRefreshSec, nowSec, prev) != prev))
             return;
 
         try
@@ -26,12 +65,15 @@ public static class DatabaseService
                     CAST(m.IS_ACTIVE AS INT) AS IsActive,
                     J1.NAME AS DelayName,
                     J1.DELAYCATEGORY,
-                    J1.DELAYCLASS_OID
+                    J1.DELAYCLASS_OID,
+                    J3.NAME AS DelayCategoryName
                 FROM [msmodel_rep].[dbo].[MACHINE] m WITH (NOLOCK)
                 LEFT JOIN [mshist_rep].[dbo].[DELAY] P WITH (NOLOCK)
                     ON P.TARGET_MACHINE = m.MACHINE_OID AND P.STATUS = 3
                 LEFT JOIN [msmodel_rep].[dbo].[DELAYCLASS] J1 WITH (NOLOCK)
                     ON P.DELAYCLASS = J1.DELAYCLASS_OID
+                LEFT JOIN [msmodel_rep].[dbo].[DELAYCATEGORY] J3 WITH (NOLOCK)
+                    ON J1.DELAYCATEGORY = J3.DELAYCATEGORY_OID
                 WHERE LEFT(UPPER(LTRIM(RTRIM(m.NAME))), 2) IN ('CB', 'HB', 'KB', 'CT', 'KT')
                 OPTION (RECOMPILE);
                 """;
@@ -49,11 +91,20 @@ public static class DatabaseService
                 string dName = rdr.IsDBNull(2) ? "" : (rdr.GetValue(2)?.ToString()?.Trim() ?? "");
                 long? dCat = !rdr.IsDBNull(3) && long.TryParse(rdr.GetValue(3)?.ToString()?.Trim(), out long dc) ? dc : null;
                 long? dCls = !rdr.IsDBNull(4) && long.TryParse(rdr.GetValue(4)?.ToString()?.Trim(), out long dco) ? dco : null;
-                bool isBd = dCat is 165096025 or 165096022 || dCls is 165097066 or 165097069;
-                bool hasDelay = !string.IsNullOrWhiteSpace(dName) || dCat.HasValue || dCls.HasValue;
-                if (!isActive || isBd || hasDelay) excluded.Add(oid);
+                string dCatName = rdr.IsDBNull(5) ? "" : (rdr.GetValue(5)?.ToString()?.Trim() ?? "");
+                string combinedDelay = string.IsNullOrWhiteSpace(dCatName) ? dName : $"{dName} {dCatName}".Trim();
+
+                if (!IsUnitNormalForAvailability(isActive, dCat, dCls, combinedDelay))
+                    excluded.Add(oid);
             }
             _excludedAvailabilityOids = excluded;
+            Interlocked.Exchange(ref _lastExcludedRefreshSec, nowSec);
+
+            if (excluded.Count > 0)
+            {
+                var todayLocal = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, cfg.Timezone).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                try { RecordBdDay(cfg.DbFile, todayLocal, excluded); } catch { }
+            }
         }
         catch { }
     }
@@ -1019,11 +1070,13 @@ public static class DatabaseService
 
             if (pingObj.Count == 0) continue;
 
-            bool isAntri = delayName.Contains("Antri", StringComparison.OrdinalIgnoreCase);
             bool isBd = delayCat is 165096025 or 165096022 || delayCls is 165097066 or 165097069;
-            bool hasDelay = !string.IsNullOrWhiteSpace(delayName) || delayCat.HasValue || delayCls.HasValue;
-            if (mStatus != 1 || isBd || hasDelay) excludedOids.Add(oid);
-            if (isBd || isAntri) bdOids.Add(oid);
+            bool isNormalUnit = IsUnitNormalForAvailability(mStatus == 1, delayCat, delayCls, delayName);
+            if (!isNormalUnit)
+            {
+                excludedOids.Add(oid);
+                bdOids.Add(oid);
+            }
 
             double? satellites = null;
             string? gpsStateStr = null;

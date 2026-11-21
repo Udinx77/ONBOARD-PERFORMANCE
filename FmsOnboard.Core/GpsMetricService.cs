@@ -38,7 +38,7 @@ public static class GpsMetricService
         using var conn = new OdbcConnection(cfg.SqlConnectionString);
         conn.Open();
         using var cmd = new OdbcCommand(sql, conn);
-        cmd.CommandTimeout = 60;
+        cmd.CommandTimeout = 120;
         using var reader = cmd.ExecuteReader();
 
         var cols = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);

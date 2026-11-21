@@ -1115,8 +1115,10 @@
         setMiniKpi("kpiP", ov.P?.availability_pct);
         setMiniKpi("kpiG", data.gps_overall?.availability_pct);
 
+        const activeUnits = ov.combined?.active_unit_count ?? Math.round((ov.combined?.target_count ?? 0) / 3);
+        const totalDevs = ov.combined?.target_count ?? 0;
         document.getElementById("subCaption").textContent =
-          `Coverage ${fmtPct(ov.combined?.coverage_pct)} | Target ${ov.combined?.target_count ?? 0} unit | ${data.excluded_count ?? 0} unit Breakdown/Antri tidak dihitung | Auto-refresh @Cfg.SqlRefreshSeconds d`;
+          `Coverage ${fmtPct(ov.combined?.coverage_pct)} | Target ${activeUnits} unit normal (${totalDevs} perangkat) | ${data.excluded_count ?? 0} unit non-normal/BD tidak dihitung | Auto-refresh @Cfg.SqlRefreshSeconds d`;
       });
 
       conn.on("collector_status", st => {

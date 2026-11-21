@@ -1,0 +1,207 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.NetworkInformation;
+using FmsOnboard.Core;
+
+namespace FmsOnboard.Collector;
+
+public sealed class CollectorWorker(AppConfig cfg, ILogger<CollectorWorker> logger) : BackgroundService
+{
+    private static readonly byte[] PingPayload = new byte[32];
+    private static double NowUnix() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+
+    private static async Task<PingStat> PingSingleIpAsync(IPAddress ip, int count, TimeSpan interval, int timeoutMs, CancellationToken ct)
+    {
+        using var pinger = new Ping();
+        var options = new PingOptions(64, false);
+        int received = 0;
+        var rtts = new List<double>(count);
+
+        for (int seq = 0; seq < count; seq++)
+        {
+            if (seq > 0 && interval > TimeSpan.Zero)
+                await Task.Delay(interval, ct);
+
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var reply = await pinger.SendPingAsync(ip, timeoutMs, PingPayload, options);
+                sw.Stop();
+                if (reply.Status == IPStatus.Success)
+                {
+                    received++;
+                    rtts.Add(reply.RoundtripTime > 0 ? reply.RoundtripTime : sw.Elapsed.TotalMilliseconds);
+                }
+            }
+            catch { }
+        }
+
+        int sent = Math.Max(1, count);
+        double lossPct = ((sent - received) / (double)sent) * 100.0;
+        double? avgRtt = rtts.Count > 0 ? rtts.Average() : null;
+        return new PingStat(ip.ToString(), sent, received, lossPct, avgRtt);
+    }
+
+    private async Task<Dictionary<string, PingStat>> PingAllIpsAsync(List<IPAddress> ips, CancellationToken ct)
+    {
+        using var sem = new SemaphoreSlim(Math.Max(1, cfg.ConcurrentTasks));
+        var interval = TimeSpan.FromSeconds(Math.Max(0.0, cfg.PingIntervalSeconds));
+        int timeoutMs = Math.Max(100, (int)(cfg.PingTimeoutSeconds * 1000));
+        int count = Math.Max(1, cfg.PingCount);
+
+        var tasks = ips.Select(async ip =>
+        {
+            await sem.WaitAsync(ct);
+            try { return await PingSingleIpAsync(ip, count, interval, timeoutMs, ct); }
+            finally { sem.Release(); }
+        }).ToList();
+
+        var stats = await Task.WhenAll(tasks);
+        return stats.ToDictionary(s => s.IpAddress, s => s);
+    }
+
+    private async Task RunSatelliteLoopAsync(CancellationToken ct)
+    {
+        int refreshMins = Math.Max(1, cfg.GpsQueryRefreshMinutes);
+        var interval = TimeSpan.FromSeconds(5);
+        int maxGap = Math.Max(600, Math.Max(refreshMins * 180, cfg.MaxObservationGapSeconds));
+
+        logger.LogInformation(
+            "[GPS-SAT] Worker satelit aktif (jeda 5 detik pasca-query; <= {Red} merah, {YMin}-{YMax} kuning, > {YGreen} hijau).",
+            cfg.GpsRedBelow, cfg.GpsRedBelow + 1, cfg.GpsYellowMax, cfg.GpsYellowMax);
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var (units, counted) = await Task.Run(() =>
+                {
+                    var values = GpsMetricService.FetchGpsValues(cfg);
+                    var knownUnits = DatabaseService.LoadCachedMachineMap(cfg);
+                    double nowTs = NowUnix();
+
+                    var seenOids = new HashSet<long>();
+                    var statusRows = new List<(long, string, double?, string, double)>();
+                    var samples = new List<(long, string, bool)>();
+
+                    foreach (var (oid, name) in knownUnits)
+                    {
+                        seenOids.Add(oid);
+                        values.TryGetValue(oid, out var val);
+                        var st = GpsMetricService.EvaluateGpsState(cfg, val) ?? "unknown";
+                        statusRows.Add((oid, name, val, st, nowTs));
+                        if (st != "unknown") samples.Add((oid, name, st == "ok"));
+                    }
+
+                    foreach (var (oid, val) in values)
+                    {
+                        if (seenOids.Contains(oid)) continue;
+                        var name = $"OID-{oid}";
+                        var st = GpsMetricService.EvaluateGpsState(cfg, val) ?? "unknown";
+                        statusRows.Add((oid, name, val, st, nowTs));
+                        if (st != "unknown") samples.Add((oid, name, st == "ok"));
+                    }
+
+                    DatabaseService.UpsertGpsSatelliteStatus(cfg.DbFile, statusRows);
+                    int c = DatabaseService.SaveGpsSamples(cfg, samples, maxGap);
+                    return (statusRows.Count, c);
+                }, ct);
+
+                logger.LogInformation("[GPS-SAT] Tersimpan {Units} unit (interval dihitung: {Counted}).", units, counted);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception ex) { logger.LogWarning("[GPS-SAT] Query satelit gagal: {Msg}", ex.Message); }
+
+            await Task.Delay(interval, ct);
+        }
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var watcher = new MachineMapService.MapWatcher(cfg, logger);
+        bool satActive = GpsMetricService.SatelliteMode(cfg);
+
+        Task? satTask = null;
+        if (satActive)
+            satTask = Task.Run(() => RunSatelliteLoopAsync(stoppingToken), stoppingToken);
+        else
+            logger.LogWarning("[GPS-SAT] Mode satelit tidak aktif (periksa query_gps.sql dan GPS_METRIC_COLUMN).");
+
+        var lastCleanup = DateTime.UtcNow.AddDays(-1);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var cycleSw = Stopwatch.StartNew();
+            double startedAt = NowUnix();
+            watcher.Poll();
+
+            var targets = watcher.Targets
+                .Where(t => !(satActive && t.DeviceType == "G"))
+                .ToList();
+
+            if (cfg.CanaryIps.Count > 0)
+            {
+                var canaryRes = await PingAllIpsAsync(cfg.CanaryIps, stoppingToken);
+                if (canaryRes.Count > 0 && canaryRes.Values.All(s => s.PacketsReceived == 0))
+                {
+                    double fin = NowUnix();
+                    logger.LogWarning("[CANARY] Semua canary IP 100% packet loss; siklus scan dibatalkan.");
+                    try { DatabaseService.RecordFailedScan(cfg.DbFile, startedAt, fin, targets.Count, "CANARY: Semua canary IP 100% packet loss"); } catch { }
+                    var wait = TimeSpan.FromSeconds(cfg.ScanIntervalSeconds) - cycleSw.Elapsed;
+                    if (wait > TimeSpan.Zero) await Task.Delay(wait, stoppingToken);
+                    continue;
+                }
+            }
+
+            var uniqueIps = targets
+                .Select(t => IPAddress.TryParse(t.IpAddress, out var ip) ? ip : null)
+                .Where(ip => ip is not null)
+                .Cast<IPAddress>()
+                .Distinct()
+                .ToList();
+
+            var pingMap = await PingAllIpsAsync(uniqueIps, stoppingToken);
+            double finishedAt = NowUnix();
+            string[] skipTypes = satActive ? ["G"] : [];
+
+            try
+            {
+                long scanId = DatabaseService.SaveScanResults(cfg, startedAt, finishedAt, targets, pingMap, skipTypes);
+                logger.LogInformation("[SCAN #{Id}] Selesai {Count} target dalam {Dur:F2}s.", scanId, targets.Count, finishedAt - startedAt);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("[SCAN] Gagal menyimpan ke SQLite: {Msg}", ex.Message);
+                try { DatabaseService.RecordFailedScan(cfg.DbFile, startedAt, finishedAt, targets.Count, ex.Message); } catch { }
+            }
+
+            if (DateTime.UtcNow - lastCleanup >= TimeSpan.FromHours(24))
+            {
+                lastCleanup = DateTime.UtcNow;
+                try
+                {
+                    var (h, s) = DatabaseService.CleanupOldHistory(cfg.DbFile, cfg.PingHistoryRetentionDays);
+                    if (h > 0 || s > 0) logger.LogInformation("[CLEANUP] Menghapus {H} ping_history & {S} scan_runs lama.", h, s);
+                }
+                catch { }
+
+                if (cfg.AvailabilityPurge)
+                {
+                    try
+                    {
+                        var purged = DatabaseService.PurgeExportedMonths(cfg, cfg.AvailabilityKeepMonths);
+                        if (purged.Count > 0) logger.LogInformation("[PURGE] Retensi bulanan membersihkan {Count} bulan.", purged.Count);
+                    }
+                    catch { }
+                }
+            }
+
+            var targetInterval = TimeSpan.FromSeconds(Math.Max(5, cfg.ScanIntervalSeconds));
+            var sleepFor = targetInterval - cycleSw.Elapsed;
+            if (sleepFor > TimeSpan.Zero)
+                await Task.Delay(sleepFor, stoppingToken);
+        }
+
+        if (satTask is not null) await satTask;
+    }
+}

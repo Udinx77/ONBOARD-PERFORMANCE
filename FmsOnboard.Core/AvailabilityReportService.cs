@@ -223,9 +223,11 @@ public static class AvailabilityReportService
             };
         }
 
+        int activeUnitCount = machineMap.Keys.Count(oid => !excludeOids.Contains(oid));
         double totalExpected = periodSeconds * totalTargets;
         overallObj["combined"] = new Dictionary<string, object?>
         {
+            ["active_unit_count"] = activeUnitCount,
             ["target_count"] = totalTargets,
             ["devices_with_data"] = totalWithData,
             ["uptime_seconds"] = totalUp,
